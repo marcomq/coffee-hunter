@@ -25,8 +25,9 @@ const FILTER_STEP_TIME := 0.68
 # Contact turns fatal at the later of the two arrivals, which is what makes a
 # graze survivable and a walk-in deadly: escaping needs a whole step.
 const CONTACT_TOUCH_FRACTION := 0.35
-# Matches the enemy move tween in main.gd; the rules time contact against it.
-const ENEMY_MOVE_FRACTION := 0.82
+# Contact begins before the full visual step has completed, so grazing a pod
+# remains escapable even though its sprite now moves continuously between ticks.
+const ENEMY_CONTACT_MOVE_FRACTION := 0.82
 const RESPAWN_INVULNERABILITY := 3.0
 const ENEMY_SQUASH_SCORE := 200
 const EXTRA_LIFE_SCORE := 2000
@@ -40,6 +41,7 @@ const ENEMY_RESPAWN_DELAY := 14.0
 # A rock that catches several enemies in one drop is the Dig Dug reward; every
 # further pod in the same fall doubles the payout.
 const MULTI_SQUASH_MULTIPLIER := 2
+const ENEMY_DIG_INTERVAL := 20
 # Where pods queue up around the nest. Offsets, because the cross moves per level.
 const ENEMY_START_OFFSETS := [
 	Vector2i(0, 0), Vector2i(0, -1), Vector2i(0, 1), Vector2i(-1, 0), Vector2i(1, 0),
@@ -55,9 +57,11 @@ var enemies: Array[Vector2i] = []
 var enemy_alive: Array[bool] = []
 var enemy_directions: Array[Vector2i] = []
 var enemy_spawn_ticks: Array[int] = []
+var enemy_turns_since_dig: Array[int] = []
 var enemy_tick := 0
 var falling_filters: Array[Vector2i] = []
 var falling_filter_states: Array[bool] = []
+var filter_pushed_at: Array[float] = []
 var level_filter_starts: Array[Vector2i] = []
 var score := 0
 var lives := 3
@@ -154,18 +158,21 @@ func _reset_actors(revive_enemies: bool) -> void:
 	enemies.clear()
 	enemy_directions.clear()
 	enemy_spawn_ticks.clear()
+	enemy_turns_since_dig.clear()
 	enemy_tick = 0
 	enemy_random.seed = 0xC0FFEE + level_index
 	var pod_count := LevelDataClass.tea_pod_count(level_index)
+	var enemy_count := pod_count + (1 if LevelDataClass.has_ultra(level_index) else 0)
 	if revive_enemies:
 		enemy_alive.clear()
-		enemy_alive.resize(pod_count)
+		enemy_alive.resize(enemy_count)
 		enemy_alive.fill(true)
 		enemy_respawn_at.clear()
-	for enemy_index in range(pod_count):
+	for enemy_index in range(enemy_count):
 		enemies.append(_enemy_start(enemy_index))
 		enemy_directions.append([Vector2i.LEFT, Vector2i.RIGHT, Vector2i.UP, Vector2i.DOWN][enemy_index % 4])
 		enemy_spawn_ticks.append(_enemy_spawn_tick(enemy_index))
+		enemy_turns_since_dig.append(0)
 	if not revive_enemies:
 		enemy_alive.assign(survivors)
 	enemy_prev.assign(enemies)
@@ -175,6 +182,7 @@ func _reset_actors(revive_enemies: bool) -> void:
 	falling_filters.assign(level_filter_starts)
 	falling_filter_states.resize(level_filter_starts.size())
 	falling_filter_states.fill(false)
+	filter_pushed_at.clear()
 	_sync_parallel_arrays()
 
 
@@ -185,7 +193,7 @@ func _enemy_spawn_tick(enemy_index: int) -> int:
 
 
 func is_ultra(enemy_index: int) -> bool:
-	return LevelDataClass.has_ultra(level_index) and enemy_index == LevelDataClass.tea_pod_count(level_index) - 1
+	return LevelDataClass.has_ultra(level_index) and enemy_index == LevelDataClass.tea_pod_count(level_index)
 
 
 func enemy_kind(enemy_index: int) -> StringName:
@@ -252,8 +260,13 @@ func _sync_parallel_arrays() -> void:
 		enemy_arrives_at.resize(enemies.size())
 	if enemy_prev.size() != enemies.size():
 		enemy_prev.assign(enemies)
+	if enemy_turns_since_dig.size() != enemies.size():
+		enemy_turns_since_dig.resize(enemies.size())
 	if filter_kill_streak.size() != falling_filters.size():
 		filter_kill_streak.resize(falling_filters.size())
+	while filter_pushed_at.size() < falling_filters.size():
+		filter_pushed_at.append(-1.0)
+	filter_pushed_at.resize(falling_filters.size())
 
 
 func start_game() -> void:
@@ -303,7 +316,7 @@ func enemy_touch_delay(enemy_index: int = -1) -> float:
 	var step_time := enemy_step_time()
 	if enemy_index >= 0:
 		step_time = enemy_step_time_for_kind(enemy_kind(enemy_index))
-	return step_time * ENEMY_MOVE_FRACTION * CONTACT_TOUCH_FRACTION
+	return step_time * ENEMY_CONTACT_MOVE_FRACTION * CONTACT_TOUCH_FRACTION
 
 
 func index(cell: Vector2i) -> int:
@@ -335,6 +348,8 @@ func move_player(direction: Vector2i) -> bool:
 	if filter_index >= 0:
 		if direction.y != 0:
 			return false
+		if falling_filter_states[filter_index]:
+			return false
 		# A filter ploughs sideways through undug soil; only beans, other
 		# filters, live tea-pods and the map edge stop it.
 		var pushed_to := target + direction
@@ -343,6 +358,9 @@ func move_player(direction: Vector2i) -> bool:
 		if _active_enemy_at(pushed_to) >= 0 or beans.has(pushed_to) or falling_filters.has(pushed_to):
 			return false
 		falling_filters[filter_index] = pushed_to
+		var below_pushed_filter := pushed_to + Vector2i.DOWN
+		falling_filter_states[filter_index] = is_inside(below_pushed_filter) and get_cell(below_pushed_filter) == Cell.TUNNEL
+		filter_pushed_at[filter_index] = world_time
 
 	player_prev = player
 	player_moved_at = world_time
@@ -419,6 +437,7 @@ func _revive_enemies() -> bool:
 		enemy_prev[enemy_index] = nest
 		enemy_arrives_at[enemy_index] = world_time
 		enemy_directions[enemy_index] = [Vector2i.LEFT, Vector2i.RIGHT, Vector2i.UP, Vector2i.DOWN][enemy_index % 4]
+		enemy_turns_since_dig[enemy_index] = 0
 		event_emitted.emit(&"enemy_respawned", nest)
 		revived = true
 	return revived
@@ -439,6 +458,16 @@ func _collect_at_player() -> void:
 func _advance_filter() -> bool:
 	var moved := false
 	for filter_index in range(falling_filters.size()):
+		if not is_inside(falling_filters[filter_index]):
+			continue
+		if filter_pushed_at[filter_index] >= 0.0:
+			if world_time - filter_pushed_at[filter_index] < player_step_time():
+				continue
+			var pushed_below := falling_filters[filter_index] + Vector2i.DOWN
+			var pushed_tunnel_is_fresh := is_inside(pushed_below) and get_cell(pushed_below) == Cell.TUNNEL and tunnel_opened_at.has(pushed_below) and world_time - float(tunnel_opened_at[pushed_below]) < FRESH_TUNNEL_FALL_DELAY
+			if pushed_tunnel_is_fresh:
+				continue
+			filter_pushed_at[filter_index] = -1.0
 		var below := falling_filters[filter_index] + Vector2i.DOWN
 		var support_is_mature := not tunnel_opened_at.has(below) or world_time - float(tunnel_opened_at[below]) >= FRESH_TUNNEL_FALL_DELAY
 		var can_fall := is_inside(below) and get_cell(below) == Cell.TUNNEL and support_is_mature and not falling_filters.has(below)
@@ -474,12 +503,19 @@ func _advance_enemy(kind: StringName = &"all") -> bool:
 		enemy_prev[enemy_index] = enemies[enemy_index]
 		if not is_enemy_active(enemy_index):
 			continue
+		enemy_turns_since_dig[enemy_index] += 1
 		var should_chase := is_ultra(enemy_index) or enemy_random.randi_range(0, 12) == 1
 		var direction := _choose_enemy_direction(enemy_index, should_chase)
 		if direction == Vector2i.ZERO:
 			continue
 		enemy_directions[enemy_index] = direction
-		enemies[enemy_index] += direction
+		var destination := enemies[enemy_index] + direction
+		if get_cell(destination) == Cell.SOIL:
+			set_cell(destination, Cell.TUNNEL)
+			tunnel_opened_at[destination] = world_time
+			enemy_turns_since_dig[enemy_index] = 0
+			event_emitted.emit(&"dug", destination)
+		enemies[enemy_index] = destination
 		enemy_arrives_at[enemy_index] = world_time + enemy_touch_delay(enemy_index)
 		moved = true
 	return moved
@@ -491,12 +527,23 @@ func is_enemy_active(enemy_index: int) -> bool:
 
 func _choose_enemy_direction(enemy_index: int, should_chase: bool) -> Vector2i:
 	var forward := enemy_directions[enemy_index]
+	if is_ultra(enemy_index):
+		var delta := player - enemies[enemy_index]
+		var direct_directions := _directions_toward(delta)
+		for direction in direct_directions:
+			if _enemy_can_dig(enemy_index, direction):
+				return direction
+		var path_direction := _shortest_tunnel_direction(enemy_index)
+		if path_direction != Vector2i.ZERO:
+			return path_direction
 	if should_chase:
 		var delta := player - enemies[enemy_index]
 		var chase_direction := Vector2i(signi(delta.x), 0) if absi(delta.x) > absi(delta.y) else Vector2i(0, signi(delta.y))
 		if _enemy_can_move(enemy_index, chase_direction):
 			return chase_direction
 	if _enemy_can_move(enemy_index, forward):
+		return forward
+	if enemy_kind(enemy_index) == &"teapot" and _enemy_can_dig(enemy_index, forward):
 		return forward
 	var left := Vector2i(forward.y, -forward.x)
 	var right := Vector2i(-forward.y, forward.x)
@@ -520,6 +567,54 @@ func _enemy_can_move(enemy_index: int, direction: Vector2i) -> bool:
 		if other_index != enemy_index and is_enemy_active(other_index) and enemies[other_index] == candidate:
 			return false
 	return true
+
+
+func _enemy_can_dig(enemy_index: int, direction: Vector2i) -> bool:
+	if direction == Vector2i.ZERO or enemy_kind(enemy_index) not in [&"teapot", &"ultra"]:
+		return false
+	if enemy_turns_since_dig[enemy_index] < ENEMY_DIG_INTERVAL:
+		return false
+	var candidate := enemies[enemy_index] + direction
+	if not is_inside(candidate) or get_cell(candidate) != Cell.SOIL:
+		return false
+	if beans.has(candidate) or falling_filters.has(candidate):
+		return false
+	return _active_enemy_at(candidate) < 0
+
+
+func _directions_toward(delta: Vector2i) -> Array[Vector2i]:
+	var directions: Array[Vector2i] = []
+	if delta.x != 0:
+		directions.append(Vector2i(signi(delta.x), 0))
+	if delta.y != 0:
+		directions.append(Vector2i(0, signi(delta.y)))
+	return directions
+
+
+func _shortest_tunnel_direction(enemy_index: int) -> Vector2i:
+	var start := enemies[enemy_index]
+	var queue: Array[Vector2i] = [start]
+	var first_step := {start: Vector2i.ZERO}
+	var queue_index := 0
+	while queue_index < queue.size():
+		var current := queue[queue_index]
+		queue_index += 1
+		var directions := _directions_toward(player - current)
+		for cardinal in [Vector2i.LEFT, Vector2i.RIGHT, Vector2i.UP, Vector2i.DOWN]:
+			if not directions.has(cardinal):
+				directions.append(cardinal)
+		for direction: Vector2i in directions:
+			var candidate: Vector2i = current + direction
+			if first_step.has(candidate) or not is_inside(candidate) or get_cell(candidate) != Cell.TUNNEL or falling_filters.has(candidate):
+				continue
+			if candidate != player and _active_enemy_at(candidate) >= 0:
+				continue
+			var initial_direction: Vector2i = direction if current == start else first_step[current]
+			if candidate == player:
+				return initial_direction
+			first_step[candidate] = initial_direction
+			queue.append(candidate)
+	return Vector2i.ZERO
 
 
 func _active_enemy_at(cell: Vector2i) -> int:

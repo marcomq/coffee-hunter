@@ -18,7 +18,8 @@ func _init() -> void:
 	_test_the_run_continues_past_the_last_authored_level()
 	_test_level_layout_varies()
 	_test_bean_count_and_score_rise_per_level()
-	_test_ultra_chaser_stays_out_of_early_levels()
+	_test_ultra_chaser_enters_after_delay()
+	await _test_ultra_chaser_node_becomes_visible()
 	_test_tea_pots_start_at_level_three()
 	_test_enemy_kind_speeds()
 	_test_randomized_placement_is_valid()
@@ -41,6 +42,8 @@ func _init() -> void:
 	_test_filter_landing_is_announced()
 	_test_realtime_ticks_are_decoupled()
 	_test_enemy_prefers_forward_motion()
+	_test_only_teapot_and_ultra_can_dig_every_twentieth_turn()
+	_test_ultra_finds_a_shortest_tunnel_path()
 	_test_falling_filter_kills_enemy()
 	_test_squashed_enemies_stay_squashed_after_a_life_is_lost()
 	_test_squashed_pods_come_back_from_the_nest()
@@ -49,6 +52,8 @@ func _init() -> void:
 	_test_every_sound_effect_exists()
 	_test_menu_keys_are_bound()
 	_test_filter_pushes_sideways_through_soil()
+	_test_pushed_filter_finishes_its_step_before_falling()
+	_test_filter_stays_on_the_bottom_edge_after_a_push()
 	_test_filter_push_blockers()
 	_test_win()
 	if failures == 0:
@@ -142,17 +147,36 @@ func _test_bean_count_and_score_rise_per_level() -> void:
 			_expect(tier_totals[tier] == LevelDataClass.BEAN_COUNTS[tier][level_index], "bean_tier reproduces the configured tier mix (level %d tier %d)" % [level_index + 1, tier])
 
 
-func _test_ultra_chaser_stays_out_of_early_levels() -> void:
+func _test_ultra_chaser_enters_after_delay() -> void:
 	var game := GameStateClass.new()
-	for enemy_index in range(game.enemies.size()):
-		_expect(not game.is_ultra(enemy_index), "no relentless chaser exists in level 1")
-	while game.level_index < LevelDataClass.ULTRA_FIRST_LEVEL:
-		game.phase = GameStateClass.Phase.WON
-		_expect(game.next_level(), "advancing to level %d" % (game.level_index + 2))
-	var ultra_index := LevelDataClass.tea_pod_count(game.level_index) - 1
-	_expect(game.is_ultra(ultra_index), "the relentless chaser joins from level %d" % (LevelDataClass.ULTRA_FIRST_LEVEL + 1))
+	var ultra_index := LevelDataClass.tea_pod_count(game.level_index)
+	_expect(game.is_ultra(ultra_index), "the relentless chaser is part of level 1")
+	_expect(game.enemies.size() == LevelDataClass.tea_pod_count(0) + 1, "the chaser is added without replacing a tea-pod")
 	_expect(game.enemy_spawn_ticks[ultra_index] == LevelDataClass.ULTRA_SPAWN_TICK, "the chaser enters after a short fixed delay")
 	_expect(game.enemy_spawn_ticks[ultra_index] > game.enemy_spawn_ticks[0], "the chaser enters after the ordinary pods")
+	game.start_game()
+	for tick in range(LevelDataClass.ULTRA_SPAWN_TICK - 1):
+		game.tick_enemy(&"teapod")
+	_expect(not game.is_enemy_active(ultra_index), "the chaser remains hidden during its short entrance delay")
+	game.tick_enemy(&"teapod")
+	_expect(game.is_enemy_active(ultra_index), "the chaser becomes active when its entrance delay ends")
+
+
+func _test_ultra_chaser_node_becomes_visible() -> void:
+	var main: Variant = load("res://scenes/main.tscn").instantiate()
+	root.add_child(main)
+	await process_frame
+	var ultra_index: int = main.state.enemies.size() - 1
+	main.state.start_game()
+	main.state.enemy_tick = LevelDataClass.ULTRA_SPAWN_TICK
+	main._refresh()
+	_expect(main.enemy_nodes.size() > ultra_index, "the main scene creates a node for the chaser")
+	if main.enemy_nodes.size() > ultra_index:
+		var ultra_node: Node2D = main.enemy_nodes[ultra_index]
+		_expect(is_instance_valid(ultra_node) and ultra_node.visible, "the chaser node becomes visible after its delay")
+	await create_timer(0.5).timeout
+	main.queue_free()
+	await process_frame
 
 
 func _test_tea_pots_start_at_level_three() -> void:
@@ -181,7 +205,11 @@ func _test_randomized_placement_is_valid() -> void:
 
 
 func _test_enemies_appear_gradually() -> void:
-	var game := _started_game()
+	var game := GameStateClass.new()
+	for level in range(2):
+		game.phase = GameStateClass.Phase.WON
+		game.next_level()
+	game.start_game()
 	_expect(game.is_enemy_active(0) and not game.is_enemy_active(1), "only first tea-pod is initially active")
 	game.tick_enemy()
 	_expect(not game.is_enemy_active(1), "second tea-pod remains delayed after one tick")
@@ -482,6 +510,65 @@ func _test_enemy_prefers_forward_motion() -> void:
 	_expect(game._choose_enemy_direction(0, true) == Vector2i.UP, "rare chase decision uses dominant axis toward player")
 
 
+func _test_only_teapot_and_ultra_can_dig_every_twentieth_turn() -> void:
+	var game := GameStateClass.new()
+	for level in range(2):
+		game.phase = GameStateClass.Phase.WON
+		game.next_level()
+	game.start_game()
+	game.cells.fill(GameStateClass.Cell.SOIL)
+	game.beans.clear()
+	game.falling_filters.clear()
+	game.falling_filter_states.clear()
+	game.enemy_alive.fill(false)
+	var teapot_index := 1
+	game.enemy_alive[teapot_index] = true
+	game.enemy_spawn_ticks[teapot_index] = 0
+	game.enemies[teapot_index] = Vector2i(4, 5)
+	game.enemy_directions[teapot_index] = Vector2i.RIGHT
+	game.set_cell(Vector2i(4, 5), GameStateClass.Cell.TUNNEL)
+	game.enemy_turns_since_dig[teapot_index] = GameStateClass.ENEMY_DIG_INTERVAL - 2
+	_expect(not game._advance_enemy(&"teapot"), "a tea pot cannot dig before twenty of its own turns")
+	_expect(game.get_cell(Vector2i(5, 5)) == GameStateClass.Cell.SOIL, "an early digging attempt preserves the soil")
+	game.enemy_turns_since_dig[teapot_index] = GameStateClass.ENEMY_DIG_INTERVAL - 1
+	_expect(game._advance_enemy(&"teapot"), "a tea pot may dig on its twentieth turn")
+	_expect(game.enemies[teapot_index] == Vector2i(5, 5), "the digging tea pot advances exactly one cell")
+	_expect(game.get_cell(Vector2i(5, 5)) == GameStateClass.Cell.TUNNEL, "enemy digging opens a tunnel")
+	_expect(game.enemy_turns_since_dig[teapot_index] == 0, "digging restarts the twenty-turn cooldown")
+
+	var teabag := GameStateClass.new()
+	teabag.start_game()
+	teabag.cells.fill(GameStateClass.Cell.SOIL)
+	teabag.beans.clear()
+	teabag.falling_filters.clear()
+	teabag.falling_filter_states.clear()
+	teabag.enemy_alive.fill(false)
+	teabag.enemy_alive[0] = true
+	teabag.enemies[0] = Vector2i(4, 5)
+	teabag.enemy_directions[0] = Vector2i.RIGHT
+	teabag.set_cell(Vector2i(4, 5), GameStateClass.Cell.TUNNEL)
+	teabag.enemy_turns_since_dig[0] = GameStateClass.ENEMY_DIG_INTERVAL
+	_expect(not teabag._advance_enemy(&"teapod"), "a tea-bag can never dig")
+
+
+func _test_ultra_finds_a_shortest_tunnel_path() -> void:
+	var game := _started_game()
+	game.cells.fill(GameStateClass.Cell.SOIL)
+	game.beans.clear()
+	game.falling_filters.clear()
+	game.falling_filter_states.clear()
+	game.enemy_alive.fill(false)
+	var ultra_index := LevelDataClass.tea_pod_count(game.level_index)
+	game.enemy_alive[ultra_index] = true
+	game.enemy_spawn_ticks[ultra_index] = 0
+	game.enemies[ultra_index] = Vector2i(4, 5)
+	game.player = Vector2i(6, 5)
+	for cell in [Vector2i(4, 5), Vector2i(4, 4), Vector2i(5, 4), Vector2i(6, 4), Vector2i(6, 5)]:
+		game.set_cell(cell, GameStateClass.Cell.TUNNEL)
+	game.enemy_turns_since_dig[ultra_index] = 0
+	_expect(game._choose_enemy_direction(ultra_index, true) == Vector2i.UP, "the ape follows the shortest available tunnel path toward the player")
+
+
 func _test_falling_filter_kills_enemy() -> void:
 	var game := _started_game()
 	game.player = Vector2i(2, 5)
@@ -501,7 +588,7 @@ func _test_squashed_enemies_stay_squashed_after_a_life_is_lost() -> void:
 	game.enemy_alive[0] = false
 	game.lose_life()
 	_expect(not game.enemy_alive[0], "a squashed tea-pod is not revived by losing a life")
-	_expect(game.enemy_alive.size() == LevelDataClass.tea_pod_count(0), "respawn keeps the level's tea-pod roster")
+	_expect(game.enemy_alive.size() == LevelDataClass.tea_pod_count(0) + 1, "respawn keeps every tea-pod plus the chaser")
 	game.phase = GameStateClass.Phase.WON
 	game.next_level()
 	_expect(game.enemy_alive.count(true) == game.enemy_alive.size(), "a fresh level revives every tea-pod")
@@ -522,6 +609,37 @@ func _test_filter_pushes_sideways_through_soil() -> void:
 	_expect(game.move_player(Vector2i.RIGHT), "a filter can be shoved into undug soil")
 	_expect(game.falling_filters[0] == Vector2i(5, 1), "the pushed filter moves on through the soil")
 	_expect(game.player == Vector2i(4, 1), "the player takes the cell the filter left")
+
+
+func _test_pushed_filter_finishes_its_step_before_falling() -> void:
+	var game := _started_game()
+	game.beans = {Vector2i(15, 9): 0}
+	game.enemy_alive.fill(false)
+	game.player = Vector2i(3, 4)
+	game.falling_filters = [Vector2i(4, 4)]
+	game.falling_filter_states = [false]
+	game.set_cell(Vector2i(5, 5), GameStateClass.Cell.TUNNEL)
+	_expect(game.move_player(Vector2i.RIGHT), "an exposed filter can be pushed sideways")
+	_expect(not game.tick_filter(), "a pushed filter cannot fall during the same movement step")
+	_expect(game.falling_filters[0] == Vector2i(5, 4), "the push moves exactly one cell")
+	_expect(not game.move_player(Vector2i.RIGHT), "a filter over a hole cannot be pushed across it")
+	game.advance_time(game.player_step_time())
+	_expect(game.tick_filter(), "the filter may fall after its push has visually finished")
+	_expect(game.falling_filters[0] == Vector2i(5, 5), "the following fall moves exactly one cell")
+
+
+func _test_filter_stays_on_the_bottom_edge_after_a_push() -> void:
+	var game := _started_game()
+	game.beans = {Vector2i(15, 9): 0}
+	game.enemy_alive.fill(false)
+	var bottom := GameStateClass.HEIGHT - 1
+	game.player = Vector2i(3, bottom)
+	game.falling_filters = [Vector2i(4, bottom)]
+	game.falling_filter_states = [false]
+	_expect(game.move_player(Vector2i.RIGHT), "a filter can be pushed at the bottom edge")
+	game.advance_time(game.player_step_time())
+	_expect(not game.tick_filter(), "the board edge supports a filter")
+	_expect(game.falling_filters[0] == Vector2i(5, bottom), "a filter never falls out of the board")
 
 
 func _test_filter_push_blockers() -> void:

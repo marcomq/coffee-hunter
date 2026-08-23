@@ -11,6 +11,8 @@ const BOARD_SIZE := Vector2(GameStateClass.WIDTH * TILE, GameStateClass.HEIGHT *
 const PLAYER_STEP_TIME := GameStateClass.PLAYER_STEP_TIME
 const ENEMY_STEP_TIME := GameStateClass.ENEMY_STEP_TIME
 const FILTER_STEP_TIME := GameStateClass.FILTER_STEP_TIME
+const HERO_TEXTURE := "res://assets/art/source/hero-walk-sheet-v1.png"
+const TEAPOD_FALLBACK_TEXTURE := "res://assets/art/source/tea-filter-sheet-v2.png"
 const BEAN_TEXTURES := [
 	"res://assets/art/source/coffee-bean-single-v2.png",
 	"res://assets/art/source/coffee-beans-three-v2.png",
@@ -19,7 +21,7 @@ const BEAN_TEXTURES := [
 ]
 const BEAN_SIZES := [26.0, 32.0, 36.0, 44.0]
 const ENEMY_TEXTURES := {
-	&"teapod": "res://assets/art/source/tea-filter-sheet-v2.png",
+	&"teapod": "res://assets/art/source/tea-filter-walk-sheet-v3.png",
 	&"teapot": "res://assets/art/source/tea-pot-sheet-v1.png",
 	&"ultra": "res://assets/art/source/ultra-chimp-sheet-v1.png",
 }
@@ -74,6 +76,7 @@ var player_hit_until := 0.0
 var shake_strength := 0.0
 var shield_node: Line2D
 var was_invulnerable := false
+var bean_glitter_idle_since := 0.0
 var audio: GameAudio
 var overlay: CanvasLayer
 var overlay_dim: ColorRect
@@ -145,26 +148,25 @@ func _build_hud() -> void:
 	add_child(title)
 	score_label = _label("", 18, Color.WHITE)
 	score_label.position = Vector2(850, 112)
+	score_label.size = Vector2(102, 28)
 	add_child(score_label)
 	lives_label = _label("", 18, Color("ff8f70"))
 	lives_label.position = Vector2(850, 146)
+	lives_label.size = Vector2(102, 28)
 	add_child(lives_label)
 	beans_label = _label("", 18, Color("c9a227"))
-	beans_label.position = Vector2(850, 174)
+	beans_label.position = Vector2(850, 180)
+	beans_label.size = Vector2(102, 28)
 	add_child(beans_label)
 	best_label = _label("", 14, Color("9ec9d6"))
-	best_label.position = Vector2(850, 200)
+	best_label.position = Vector2(850, 214)
+	best_label.size = Vector2(102, 24)
 	add_child(best_label)
 	status_label = _label("", 16, Color("d9efb3"))
-	status_label.position = Vector2(850, 232)
-	status_label.size = Vector2(102, 150)
+	status_label.position = Vector2(850, 252)
+	status_label.size = Vector2(102, 130)
 	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	add_child(status_label)
-
-	var teapot := _art_node(load("res://assets/art/source/teapot.png"), 82.0)
-	teapot.position = Vector2(900, 410)
-	add_child(teapot)
-
 
 func _label(text: String, size: int, color: Color) -> Label:
 	var label := Label.new()
@@ -282,9 +284,27 @@ func _handle_ui_input() -> bool:
 
 
 func _process(delta: float) -> void:
-	elapsed += delta
 	_animate_player()
 	_animate_invulnerability()
+	var player_moving := _actor_is_moving(player_node)
+	if player_moving:
+		bean_glitter_idle_since = elapsed
+	var show_bean_glitter := state.phase == GameStateClass.Phase.PLAYING and state.beans.size() <= 3 and elapsed - bean_glitter_idle_since >= 0.35
+	for cell in bean_nodes:
+		var bean: Node2D = bean_nodes[cell]
+		bean.position = _cell_position(cell) + Vector2(0, sin(elapsed * 4.0 + cell.x) * 2.0)
+		_animate_bean_glitter(bean, cell, show_bean_glitter)
+	for enemy_index in range(enemy_nodes.size()):
+		var enemy_node := enemy_nodes[enemy_index]
+		if is_instance_valid(enemy_node) and enemy_node.visible:
+			_update_enemy_frame(enemy_node, enemy_index)
+	_update_shake(delta)
+	_animate_filters()
+	queue_redraw()
+
+
+func _physics_process(delta: float) -> void:
+	elapsed += delta
 	if Input.is_action_just_pressed("mute"):
 		_toggle_mute()
 	if _handle_ui_input():
@@ -330,16 +350,6 @@ func _process(delta: float) -> void:
 	if filter_cooldown <= 0.0:
 		state.tick_filter()
 		filter_cooldown += _filter_step_time()
-
-	for cell in bean_nodes:
-		var bean: Node2D = bean_nodes[cell]
-		bean.position = _cell_position(cell) + Vector2(0, sin(elapsed * 4.0 + cell.x) * 2.0)
-	for enemy_index in range(enemy_nodes.size()):
-		var enemy_node := enemy_nodes[enemy_index]
-		if enemy_node.visible:
-			_update_enemy_frame(enemy_node, enemy_index)
-	_update_shake(delta)
-	_animate_filters()
 	queue_redraw()
 
 
@@ -381,7 +391,7 @@ func _refresh() -> void:
 		player_node = _hero_node()
 		actors.add_child(player_node)
 	_update_hero_frame()
-	_move_actor(player_node, state.player, PLAYER_STEP_TIME)
+	_move_actor(player_node, state.player, _player_step_time())
 
 	while enemy_nodes.size() < state.enemies.size():
 		var enemy_node := _enemy_node(_enemy_kind(enemy_nodes.size()))
@@ -389,6 +399,10 @@ func _refresh() -> void:
 		enemy_nodes.append(enemy_node)
 	for enemy_index in range(state.enemies.size()):
 		var enemy_node := enemy_nodes[enemy_index]
+		if not is_instance_valid(enemy_node):
+			enemy_node = _enemy_node(_enemy_kind(enemy_index))
+			actors.add_child(enemy_node)
+			enemy_nodes[enemy_index] = enemy_node
 		var was_visible: bool = enemy_node.visible
 		enemy_node.visible = state.is_enemy_active(enemy_index)
 		if enemy_node.visible:
@@ -396,7 +410,7 @@ func _refresh() -> void:
 				_snap_actor(enemy_node, state.enemies[enemy_index])
 				_pop_in(enemy_node)
 			var kind := state.enemy_kind(enemy_index)
-			_move_actor(enemy_node, state.enemies[enemy_index], _enemy_step_time_for_kind(kind) * GameStateClass.ENEMY_MOVE_FRACTION)
+			_move_actor(enemy_node, state.enemies[enemy_index], _enemy_step_time_for_kind(kind))
 
 	while filter_nodes.size() < state.falling_filters.size():
 		var filter_node := _art_node(load("res://assets/art/source/coffee-filter.png"), 44.0)
@@ -404,10 +418,16 @@ func _refresh() -> void:
 		filter_nodes.append(filter_node)
 	for filter_index in range(state.falling_filters.size()):
 		var filter_node := filter_nodes[filter_index]
-		_move_actor(filter_node, state.falling_filters[filter_index], _filter_step_time() * 0.72)
+		var filter_cell := state.falling_filters[filter_index]
+		var filter_duration := _filter_step_time() * 0.72
+		if filter_node.has_meta(&"target_cell"):
+			var previous_cell: Vector2i = filter_node.get_meta(&"target_cell")
+			if previous_cell.y == filter_cell.y:
+				filter_duration = _player_step_time()
+		_move_actor(filter_node, filter_cell, filter_duration)
 	snap_next_refresh = false
 
-	score_label.text = "SCORE\n%d" % state.score
+	score_label.text = "SCORE  %d" % state.score
 	lives_label.text = "LIVES  %d" % state.lives
 	beans_label.text = "BEANS  %d" % state.beans.size()
 	best_label.text = "BEST  %d" % maxi(high_score, state.score)
@@ -486,13 +506,19 @@ func _reset_level_view() -> void:
 
 
 func _hero_node() -> Node2D:
-	var texture: Texture2D = load("res://assets/art/source/hero-sheet.png")
-	var frame_size := Vector2(texture.get_width() / 2.0, texture.get_height() / 2.0)
+	var texture: Texture2D = load(HERO_TEXTURE)
+	var frame_size := texture.get_size() / 4.0
 	return _art_node(texture, 52.0, Rect2(Vector2.ZERO, frame_size))
 
 
 func _enemy_node(kind: StringName) -> Node2D:
 	var texture: Texture2D = load(ENEMY_TEXTURES[kind])
+	if not texture and kind == &"teapod":
+		push_warning("Tea-pod walk sheet could not be loaded; using the previous sprite sheet")
+		texture = load(TEAPOD_FALLBACK_TEXTURE)
+	if not texture:
+		push_error("Enemy texture could not be loaded for %s" % kind)
+		return Node2D.new()
 	var frame_size := texture.get_size() / 2.0
 	var node := _art_node(texture, ENEMY_SIZES[kind], Rect2(Vector2.ZERO, frame_size))
 	node.set_meta(&"enemy_kind", kind)
@@ -511,14 +537,13 @@ func _update_enemy_frame(enemy_node: Node2D, enemy_index: int) -> void:
 	var kind: StringName = enemy_node.get_meta(&"enemy_kind", &"teapod")
 	var texture: Texture2D = load(ENEMY_TEXTURES[kind])
 	var frame_size := texture.get_size() / 2.0
-	var cycle := int(floor(elapsed * 5.0 + enemy_index * 1.7)) % 16
+	var frames := [Vector2i.ZERO, Vector2i(1, 0), Vector2i(0, 1), Vector2i(1, 0)]
+	if kind == &"teapod":
+		frames = [Vector2i.ZERO, Vector2i(1, 0), Vector2i(0, 1), Vector2i(1, 1)]
 	var frame := Vector2i.ZERO
-	if cycle in [2, 6, 10]:
-		frame = Vector2i(1, 0)
-	elif cycle in [4, 8, 12]:
-		frame = Vector2i(0, 1)
-	elif cycle == 15 and kind == &"teapod":
-		frame = Vector2i(1, 1)
+	var progress := _actor_move_progress(enemy_node)
+	if progress < 1.0:
+		frame = frames[mini(int(progress * frames.size()), frames.size() - 1)]
 	_set_enemy_frame(enemy_node, frame, frame_size)
 
 
@@ -537,39 +562,86 @@ func _update_hero_frame() -> void:
 	_set_hero_frame(player_node, state.player_facing)
 
 
-func _set_hero_frame(hero: Node2D, facing: Vector2i) -> void:
-	var texture: Texture2D = load("res://assets/art/source/hero-sheet.png")
-	var frame_size := Vector2(texture.get_width() / 2.0, texture.get_height() / 2.0)
-	var frame := Vector2i.ZERO
+func _set_hero_frame(hero: Node2D, facing: Vector2i, walk_frame := 0) -> void:
+	var texture: Texture2D = load(HERO_TEXTURE)
+	var frame_size := texture.get_size() / 4.0
+	var row := 0
 	if facing == Vector2i.UP:
-		frame = Vector2i(1, 0)
+		row = 1
 	elif facing == Vector2i.LEFT:
-		frame = Vector2i(0, 1)
+		row = 2
 	elif facing == Vector2i.RIGHT:
-		frame = Vector2i(1, 1)
+		row = 2
+	var frame := Vector2i(clampi(walk_frame, 0, 3), row)
 	var region := Rect2(Vector2(frame) * frame_size, frame_size)
 	for sprite in hero.get_children():
 		if sprite is Sprite2D:
 			sprite.region_rect = region
+			sprite.flip_h = facing == Vector2i.RIGHT
 
 
 func _animate_player() -> void:
 	if not is_instance_valid(player_node) or not player_node.visible:
 		return
-	var moving := false
-	if player_node.has_meta(&"move_tween"):
-		var move_tween: Tween = player_node.get_meta(&"move_tween")
-		moving = move_tween and move_tween.is_running()
+	var moving := _actor_is_moving(player_node)
 	if moving:
-		var stride := sin(elapsed * 18.0)
-		player_node.scale = Vector2(1.0 + absf(stride) * 0.045, 1.0 - absf(stride) * 0.035)
-		player_node.rotation = stride * 0.035
+		var walk_cycle := [1, 2, 3, 2]
+		var progress := _actor_move_progress(player_node)
+		var frame_index := mini(int(progress * walk_cycle.size()), walk_cycle.size() - 1)
+		_set_hero_frame(player_node, state.player_facing, walk_cycle[frame_index])
+		player_node.scale = Vector2.ONE
+		player_node.rotation = 0.0
 	else:
+		_set_hero_frame(player_node, state.player_facing)
 		var breath := sin(elapsed * 3.2) * 0.012
 		player_node.scale = Vector2(1.0 - breath * 0.5, 1.0 + breath)
 		player_node.rotation = 0.0
 
 
+func _actor_is_moving(actor: Node2D) -> bool:
+	if not is_instance_valid(actor) or not actor.has_meta(&"move_tween"):
+		return false
+	var move_tween: Tween = actor.get_meta(&"move_tween")
+	return move_tween and move_tween.is_running()
+
+
+func _animate_bean_glitter(bean: Node2D, cell: Vector2i, active: bool) -> void:
+	var glitter: Node2D
+	if bean.has_meta(&"glitter"):
+		glitter = bean.get_meta(&"glitter")
+	else:
+		glitter = Node2D.new()
+		glitter.z_index = 3
+		for sparkle_index in range(2):
+			var sparkle := Polygon2D.new()
+			var radius := 5.0 if sparkle_index == 0 else 3.5
+			sparkle.polygon = PackedVector2Array([
+				Vector2(0, -radius), Vector2(radius * 0.28, -radius * 0.28),
+				Vector2(radius, 0), Vector2(radius * 0.28, radius * 0.28),
+				Vector2(0, radius), Vector2(-radius * 0.28, radius * 0.28),
+				Vector2(-radius, 0), Vector2(-radius * 0.28, -radius * 0.28),
+			])
+			sparkle.color = Color("fff3a6")
+			glitter.add_child(sparkle)
+		bean.add_child(glitter)
+		bean.set_meta(&"glitter", glitter)
+	glitter.visible = active
+	if not active:
+		bean.scale = Vector2.ONE
+		bean.modulate = Color.WHITE
+		return
+	var phase := elapsed * 5.5 + float(cell.x * 3 + cell.y)
+	var pulse := (sin(phase) + 1.0) * 0.5
+	bean.scale = Vector2.ONE * (1.0 + pulse * 0.045)
+	bean.modulate = Color(1.0, 0.94 + pulse * 0.06, 0.72 + pulse * 0.28)
+	glitter.rotation = phase * 0.22
+	for sparkle_index in range(glitter.get_child_count()):
+		var sparkle: Polygon2D = glitter.get_child(sparkle_index)
+		var angle := phase + float(sparkle_index) * PI
+		sparkle.position = Vector2(cos(angle), sin(angle)) * (15.0 + sparkle_index * 4.0)
+		var sparkle_pulse := 0.25 + 0.75 * absf(sin(phase * 1.7 + sparkle_index * 1.9))
+		sparkle.scale = Vector2.ONE * sparkle_pulse
+		sparkle.modulate.a = sparkle_pulse
 # Teleports (a pod climbing back out of the nest) must not be tweened across
 # the board from wherever the sprite happened to be.
 func _snap_actor(actor: Node2D, cell: Vector2i) -> void:
@@ -585,14 +657,10 @@ func _move_actor(actor: Node2D, cell: Vector2i, duration: float) -> void:
 	var target := _cell_position(cell)
 	if actor.has_meta(&"target_cell") and actor.get_meta(&"target_cell") == cell:
 		return
-	var previous_cell := cell
-	if actor.has_meta(&"target_cell"):
-		previous_cell = actor.get_meta(&"target_cell")
 	if actor.has_meta(&"move_tween"):
 		var previous_tween: Tween = actor.get_meta(&"move_tween")
 		if previous_tween and previous_tween.is_valid():
 			previous_tween.kill()
-			actor.position = _cell_position(previous_cell).round()
 	actor.set_meta(&"target_cell", cell)
 	if snap_next_refresh or actor.position == Vector2.ZERO:
 		actor.position = target.round()
@@ -602,11 +670,22 @@ func _move_actor(actor: Node2D, cell: Vector2i, duration: float) -> void:
 		return
 	var tween := create_tween()
 	actor.set_meta(&"move_tween", tween)
-	tween.tween_property(actor, "position", target.round(), duration).set_trans(Tween.TRANS_LINEAR)
+	actor.set_meta(&"move_started_at", elapsed)
+	actor.set_meta(&"move_duration", duration)
+	tween.tween_property(actor, "position", target.round(), duration).from_current().set_trans(Tween.TRANS_LINEAR)
 	tween.tween_callback(func() -> void:
 		if is_instance_valid(actor) and actor.get_meta(&"target_cell") == cell:
 			actor.position = target.round()
 	)
+
+
+func _actor_move_progress(actor: Node2D) -> float:
+	if not actor.has_meta(&"move_started_at") or not actor.has_meta(&"move_duration"):
+		return 1.0
+	var duration: float = actor.get_meta(&"move_duration")
+	if duration <= 0.0:
+		return 1.0
+	return clampf((elapsed - float(actor.get_meta(&"move_started_at"))) / duration, 0.0, 1.0)
 
 
 func _art_node(texture: Texture2D, target_size: float, region := Rect2()) -> Node2D:

@@ -31,9 +31,9 @@ const ENDLESS_BEAN_STEPS := 20
 # Tea pots enter after the first two introductory levels.
 const TEAPOT_FIRST_LEVEL := 2
 
-# The relentless chaser stays out of the tutorial levels, then enters after a
-# short visible delay so it cannot be skipped by finishing the level quickly.
-const ULTRA_FIRST_LEVEL := 3
+# The plantation owner joins every level after a short visible delay, matching
+# the story's warning that lingering too long draws his attention.
+const ULTRA_FIRST_LEVEL := 0
 const ULTRA_SPAWN_TICK := 40
 
 
