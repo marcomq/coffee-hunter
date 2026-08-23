@@ -16,11 +16,28 @@ const BEAN_TEXTURES := [
 	"res://assets/art/source/coffee-bean-giant-v2.png",
 ]
 const BEAN_SIZES := [26.0, 32.0, 36.0, 44.0]
+const LEVEL_BACKGROUNDS := [
+	"res://assets/art/source/level-tropical-background.png",
+	"res://assets/art/source/level-canyon-background-v1.png",
+	"res://assets/art/source/level-mist-marsh-background-v1.png",
+	"res://assets/art/source/level-water-lagoon-background-v1.png",
+	"res://assets/art/source/level-night-ruins-background-v1.png",
+	"res://assets/art/source/level-cloud-temple-background-v1.png",
+	"res://assets/art/source/level-canyon-background-v1.png",
+	"res://assets/art/source/level-mist-marsh-background-v1.png",
+	"res://assets/art/source/level-night-ruins-background-v1.png",
+	"res://assets/art/source/level-cloud-temple-background-v1.png",
+]
+const LEVEL_BACKGROUND_TINTS := [
+	Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE,
+	Color("e6c7b8"), Color("bed4cd"), Color("c5bde8"), Color("ffd0aa"),
+]
 
 var state: GameState
 var resolver: InputResolver
 var tile_layer: TileMapLayer
 var board: Node2D
+var backdrop: Sprite2D
 var actors := Node2D.new()
 var bean_nodes: Dictionary = {}
 var player_node: Node2D
@@ -72,10 +89,9 @@ func _build_background() -> void:
 func _build_tiles() -> void:
 	board = Node2D.new()
 	add_child(board)
-	var backdrop := Sprite2D.new()
-	backdrop.texture = load("res://assets/art/source/level-tropical-background.png")
+	backdrop = Sprite2D.new()
+	_update_level_background()
 	backdrop.position = BOARD_ORIGIN + BOARD_SIZE * 0.5
-	backdrop.scale = BOARD_SIZE / backdrop.texture.get_size()
 	board.add_child(backdrop)
 
 	tile_layer = TileMapLayer.new()
@@ -192,6 +208,7 @@ func _unhandled_input(event: InputEvent) -> void:
 
 
 func _refresh() -> void:
+	_update_level_background()
 	for y in range(GameStateClass.HEIGHT):
 		for x in range(GameStateClass.WIDTH):
 			var cell := Vector2i(x, y)
@@ -256,6 +273,17 @@ func _refresh() -> void:
 			status_label.text = "FILTERED OUT.\n\nPress R"
 		_:
 			status_label.text = "LEVEL %d / %d\nSPEED %.1f\n\nWASD / ARROWS\nDrag mouse to tilt\n\nR to restart" % [state.level_index + 1, LevelDataClass.LEVEL_COUNT, LevelDataClass.speed(state.level_index)]
+
+
+func _update_level_background() -> void:
+	if not is_instance_valid(backdrop):
+		return
+	var index := clampi(state.level_index, 0, LEVEL_BACKGROUNDS.size() - 1)
+	var next_texture: Texture2D = load(LEVEL_BACKGROUNDS[index])
+	if backdrop.texture != next_texture:
+		backdrop.texture = next_texture
+		backdrop.scale = BOARD_SIZE / next_texture.get_size()
+	backdrop.modulate = LEVEL_BACKGROUND_TINTS[index]
 
 
 func _player_step_time() -> float:
