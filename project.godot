@@ -26,3 +26,7 @@ move_right={"deadzone": 0.2, "events": [Object(InputEventKey,"physical_keycode":
 move_up={"deadzone": 0.2, "events": [Object(InputEventKey,"physical_keycode":87), Object(InputEventKey,"keycode":4194320)]}
 move_down={"deadzone": 0.2, "events": [Object(InputEventKey,"physical_keycode":83), Object(InputEventKey,"keycode":4194322)]}
 restart={"deadzone": 0.2, "events": [Object(InputEventKey,"physical_keycode":82)]}
+pause={"deadzone": 0.2, "events": [Object(InputEventKey,"physical_keycode":80)]}
+confirm={"deadzone": 0.2, "events": [Object(InputEventKey,"keycode":32), Object(InputEventKey,"keycode":4194309)]}
+mute={"deadzone": 0.2, "events": [Object(InputEventKey,"physical_keycode":77)]}
+to_title={"deadzone": 0.2, "events": [Object(InputEventKey,"keycode":4194305)]}

@@ -3,12 +3,14 @@ extends Node2D
 const GameStateClass = preload("res://scripts/game_state.gd")
 const InputResolverClass = preload("res://scripts/input_resolver.gd")
 const LevelDataClass = preload("res://scripts/level_data.gd")
+const GameAudioClass = preload("res://scripts/audio.gd")
+const SaveDataClass = preload("res://scripts/save_data.gd")
 const TILE := 48
 const BOARD_ORIGIN := Vector2(12, 6)
 const BOARD_SIZE := Vector2(GameStateClass.WIDTH * TILE, GameStateClass.HEIGHT * TILE)
-const PLAYER_STEP_TIME := 0.42
-const ENEMY_STEP_TIME := 0.95
-const FILTER_STEP_TIME := 0.68
+const PLAYER_STEP_TIME := GameStateClass.PLAYER_STEP_TIME
+const ENEMY_STEP_TIME := GameStateClass.ENEMY_STEP_TIME
+const FILTER_STEP_TIME := GameStateClass.FILTER_STEP_TIME
 const BEAN_TEXTURES := [
 	"res://assets/art/source/coffee-bean-single-v2.png",
 	"res://assets/art/source/coffee-beans-three-v2.png",
@@ -16,6 +18,12 @@ const BEAN_TEXTURES := [
 	"res://assets/art/source/coffee-bean-giant-v2.png",
 ]
 const BEAN_SIZES := [26.0, 32.0, 36.0, 44.0]
+const ENEMY_TEXTURES := {
+	&"teapod": "res://assets/art/source/tea-filter-sheet-v2.png",
+	&"teapot": "res://assets/art/source/tea-pot-sheet-v1.png",
+	&"ultra": "res://assets/art/source/ultra-chimp-sheet-v1.png",
+}
+const ENEMY_SIZES := {&"teapod": 44.0, &"teapot": 50.0, &"ultra": 56.0}
 const LEVEL_BACKGROUNDS := [
 	"res://assets/art/source/level-tropical-background.png",
 	"res://assets/art/source/level-canyon-background-v1.png",
@@ -32,6 +40,11 @@ const LEVEL_BACKGROUND_TINTS := [
 	Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE, Color.WHITE,
 	Color("e6c7b8"), Color("bed4cd"), Color("c5bde8"), Color("ffd0aa"),
 ]
+# Endless levels reuse the ten backdrops; each further lap gets its own wash so
+# a repeat never reads as the same level.
+const ENDLESS_TINTS := [Color("bcd0ff"), Color("ffc4bc"), Color("c4f0c0"), Color("edc6ff")]
+
+enum UiMode { TITLE, PLAYING, PAUSED, GAME_OVER }
 
 var state: GameState
 var resolver: InputResolver
@@ -49,6 +62,8 @@ var beans_label: Label
 var status_label: Label
 var move_cooldown := 0.0
 var enemy_cooldown := ENEMY_STEP_TIME
+var teapot_cooldown := ENEMY_STEP_TIME
+var ultra_cooldown := ENEMY_STEP_TIME
 var filter_cooldown := FILTER_STEP_TIME
 var virtual_tilt := Vector2.ZERO
 var drag_origin := Vector2.ZERO
@@ -59,20 +74,36 @@ var player_hit_until := 0.0
 var shake_strength := 0.0
 var shield_node: Line2D
 var was_invulnerable := false
+var audio: GameAudio
+var overlay: CanvasLayer
+var overlay_dim: ColorRect
+var overlay_title: Label
+var overlay_body: Label
+var best_label: Label
+var ui_mode := UiMode.TITLE
+var high_score := 0
+var best_level := 0
 
 
 func _ready() -> void:
 	state = GameStateClass.new()
 	resolver = InputResolverClass.new()
+	audio = GameAudioClass.new()
+	add_child(audio)
+	high_score = SaveDataClass.high_score()
+	best_level = SaveDataClass.best_level()
+	audio.set_muted(SaveDataClass.is_muted())
 	_build_background()
 	_build_tiles()
 	_build_hud()
 	board.add_child(actors)
 	shield_node = _build_shield()
 	actors.add_child(shield_node)
+	_build_overlay()
 	state.changed.connect(_refresh)
 	state.event_emitted.connect(_on_game_event)
 	_refresh()
+	_show_title()
 	queue_redraw()
 
 
@@ -121,8 +152,11 @@ func _build_hud() -> void:
 	beans_label = _label("", 18, Color("c9a227"))
 	beans_label.position = Vector2(850, 174)
 	add_child(beans_label)
+	best_label = _label("", 14, Color("9ec9d6"))
+	best_label.position = Vector2(850, 200)
+	add_child(best_label)
 	status_label = _label("", 16, Color("d9efb3"))
-	status_label.position = Vector2(850, 218)
+	status_label.position = Vector2(850, 232)
 	status_label.size = Vector2(102, 150)
 	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	add_child(status_label)
@@ -143,18 +177,123 @@ func _label(text: String, size: int, color: Color) -> Label:
 	return label
 
 
+func _build_overlay() -> void:
+	overlay = CanvasLayer.new()
+	overlay.layer = 2
+	add_child(overlay)
+	overlay_dim = ColorRect.new()
+	overlay_dim.color = Color(0.09, 0.06, 0.05, 0.86)
+	overlay_dim.size = Vector2(960, 540)
+	overlay.add_child(overlay_dim)
+	overlay_title = _label("", 44, Color("ffd27a"))
+	overlay_title.position = Vector2(0, 118)
+	overlay_title.size = Vector2(960, 90)
+	overlay_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	overlay.add_child(overlay_title)
+	overlay_body = _label("", 17, Color("f0e3d2"))
+	overlay_body.position = Vector2(0, 226)
+	overlay_body.size = Vector2(960, 280)
+	overlay_body.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	overlay.add_child(overlay_body)
+
+
+func _show_title() -> void:
+	ui_mode = UiMode.TITLE
+	overlay.visible = true
+	overlay_title.text = "COFFEE HUNTER"
+	var record := "NO RUN RECORDED YET"
+	if high_score > 0:
+		record = "BEST  %d      FURTHEST  LEVEL %d" % [high_score, best_level + 1]
+	overlay_body.text = "Grounds for Adventure\n\n%s\n\nWASD or ARROWS to dig, or drag the mouse to tilt\nShove a coffee filter onto a tea-pod to squash it\nCatch several pods in one drop and the payout doubles\n\nP pause      R restart      M mute      ESC title\n\nPRESS SPACE TO START" % record
+
+
+func _show_game_over(is_record: bool) -> void:
+	ui_mode = UiMode.GAME_OVER
+	overlay.visible = true
+	overlay_title.text = "FILTERED OUT"
+	var record := "SCORE  %d      BEST  %d" % [state.score, high_score]
+	if is_record:
+		record = "NEW BEST  %d" % state.score
+	overlay_body.text = "%s\nReached level %d\n\nSPACE or R for a new run      ESC for the title" % [record, state.level_index + 1]
+
+
+func _set_paused(paused: bool) -> void:
+	ui_mode = UiMode.PAUSED if paused else UiMode.PLAYING
+	overlay.visible = paused
+	audio.play(&"ui")
+	if paused:
+		overlay_title.text = "PAUSED"
+		overlay_body.text = "LEVEL %d      SCORE %d\n\nP or SPACE to resume\nR for a new run      ESC for the title" % [state.level_index + 1, state.score]
+
+
+func _begin_run() -> void:
+	audio.play(&"start")
+	ui_mode = UiMode.PLAYING
+	overlay.visible = false
+	snap_next_refresh = true
+	state.new_game()
+	_reset_level_view()
+
+
+func _toggle_mute() -> void:
+	audio.set_muted(not audio.muted)
+	SaveDataClass.set_muted(audio.muted)
+	if not audio.muted:
+		audio.play(&"ui")
+
+
+func _record_run() -> bool:
+	var is_record := SaveDataClass.record_run(state.score, state.level_index)
+	high_score = maxi(high_score, state.score)
+	best_level = maxi(best_level, state.level_index)
+	return is_record
+
+
+# True while a menu owns the frame, which is also what freezes the simulation.
+func _handle_ui_input() -> bool:
+	if ui_mode == UiMode.TITLE:
+		if Input.is_action_just_pressed("confirm"):
+			_begin_run()
+		return true
+	if ui_mode == UiMode.GAME_OVER:
+		if Input.is_action_just_pressed("confirm") or Input.is_action_just_pressed("restart"):
+			_begin_run()
+		elif Input.is_action_just_pressed("to_title"):
+			_show_title()
+		return true
+	if ui_mode == UiMode.PAUSED:
+		if Input.is_action_just_pressed("pause") or Input.is_action_just_pressed("confirm"):
+			_set_paused(false)
+		elif Input.is_action_just_pressed("restart"):
+			_begin_run()
+		elif Input.is_action_just_pressed("to_title"):
+			_show_title()
+		return true
+	if Input.is_action_just_pressed("pause"):
+		_set_paused(true)
+		return true
+	if Input.is_action_just_pressed("to_title"):
+		_show_title()
+		return true
+	if Input.is_action_just_pressed("restart"):
+		_begin_run()
+		return true
+	return false
+
+
 func _process(delta: float) -> void:
 	elapsed += delta
 	_animate_player()
 	_animate_invulnerability()
-	if Input.is_action_just_pressed("restart"):
-		snap_next_refresh = true
-		state.new_game()
-		_reset_level_view()
+	if Input.is_action_just_pressed("mute"):
+		_toggle_mute()
+	if _handle_ui_input():
+		queue_redraw()
 		return
 
 	var direction := resolver.direction_from_vector(resolver.combined_vector(virtual_tilt))
 	if state.phase == GameStateClass.Phase.WON and direction != Vector2i.ZERO:
+		_record_run()
 		if state.next_level():
 			_reset_level_view()
 			return
@@ -169,6 +308,8 @@ func _process(delta: float) -> void:
 	state.tick_contacts()
 	move_cooldown -= delta
 	enemy_cooldown -= delta
+	teapot_cooldown -= delta
+	ultra_cooldown -= delta
 	filter_cooldown -= delta
 
 	if move_cooldown <= 0.0 and elapsed >= player_hit_until:
@@ -178,8 +319,14 @@ func _process(delta: float) -> void:
 			move_cooldown = 0.0
 
 	if enemy_cooldown <= 0.0:
-		state.tick_enemy()
+		state.tick_enemy(&"teapod")
 		enemy_cooldown += _enemy_step_time()
+	if teapot_cooldown <= 0.0:
+		state.tick_enemy(&"teapot")
+		teapot_cooldown += _enemy_step_time_for_kind(&"teapot")
+	if ultra_cooldown <= 0.0:
+		state.tick_enemy(&"ultra")
+		ultra_cooldown += _enemy_step_time_for_kind(&"ultra")
 	if filter_cooldown <= 0.0:
 		state.tick_filter()
 		filter_cooldown += _filter_step_time()
@@ -237,7 +384,7 @@ func _refresh() -> void:
 	_move_actor(player_node, state.player, PLAYER_STEP_TIME)
 
 	while enemy_nodes.size() < state.enemies.size():
-		var enemy_node := _enemy_node()
+		var enemy_node := _enemy_node(_enemy_kind(enemy_nodes.size()))
 		actors.add_child(enemy_node)
 		enemy_nodes.append(enemy_node)
 	for enemy_index in range(state.enemies.size()):
@@ -246,8 +393,10 @@ func _refresh() -> void:
 		enemy_node.visible = state.is_enemy_active(enemy_index)
 		if enemy_node.visible:
 			if not was_visible:
+				_snap_actor(enemy_node, state.enemies[enemy_index])
 				_pop_in(enemy_node)
-			_move_actor(enemy_node, state.enemies[enemy_index], _enemy_step_time() * 0.82)
+			var kind := state.enemy_kind(enemy_index)
+			_move_actor(enemy_node, state.enemies[enemy_index], _enemy_step_time_for_kind(kind) * GameStateClass.ENEMY_MOVE_FRACTION)
 
 	while filter_nodes.size() < state.falling_filters.size():
 		var filter_node := _art_node(load("res://assets/art/source/coffee-filter.png"), 44.0)
@@ -261,41 +410,55 @@ func _refresh() -> void:
 	score_label.text = "SCORE\n%d" % state.score
 	lives_label.text = "LIVES  %d" % state.lives
 	beans_label.text = "BEANS  %d" % state.beans.size()
+	best_label.text = "BEST  %d" % maxi(high_score, state.score)
+	if audio and audio.muted:
+		best_label.text += "   MUTED"
 	match state.phase:
 		GameStateClass.Phase.READY:
 			status_label.text = "PRESS A DIRECTION\nTO START\n\nWASD / ARROWS\nor drag to tilt"
 		GameStateClass.Phase.WON:
-			if state.level_index + 1 < LevelDataClass.LEVEL_COUNT:
-				status_label.text = "LEVEL CLEARED!\n\nPress a direction\nfor next level"
+			if LevelDataClass.is_endless(state.level_index):
+				status_label.text = "LEVEL CLEARED!\nPast the map now.\n\nPress a direction\nto keep going"
 			else:
-				status_label.text = "ALL 10 LEVELS!\nA serious victory.\n\nPress R"
+				status_label.text = "LEVEL CLEARED!\n\nPress a direction\nfor next level"
 		GameStateClass.Phase.GAME_OVER:
 			status_label.text = "FILTERED OUT.\n\nPress R"
 		_:
-			status_label.text = "LEVEL %d / %d\nSPEED %.1f\n\nWASD / ARROWS\nDrag mouse to tilt\n\nR to restart" % [state.level_index + 1, LevelDataClass.LEVEL_COUNT, LevelDataClass.speed(state.level_index)]
+			var level_line := "LEVEL %d" % (state.level_index + 1)
+			if LevelDataClass.is_endless(state.level_index):
+				level_line += "  ENDLESS"
+			status_label.text = "%s\nSPEED %.1f\n\nWASD / ARROWS\nDrag mouse to tilt\n\nP pause  R restart" % [level_line, LevelDataClass.speed(state.level_index)]
 
 
 func _update_level_background() -> void:
 	if not is_instance_valid(backdrop):
 		return
-	var index := clampi(state.level_index, 0, LEVEL_BACKGROUNDS.size() - 1)
+	var index: int = maxi(state.level_index, 0) % LEVEL_BACKGROUNDS.size()
 	var next_texture: Texture2D = load(LEVEL_BACKGROUNDS[index])
 	if backdrop.texture != next_texture:
 		backdrop.texture = next_texture
 		backdrop.scale = BOARD_SIZE / next_texture.get_size()
-	backdrop.modulate = LEVEL_BACKGROUND_TINTS[index]
+	var tint: Color = LEVEL_BACKGROUND_TINTS[index]
+	var lap: int = maxi(state.level_index, 0) / LEVEL_BACKGROUNDS.size()
+	if lap > 0:
+		tint *= ENDLESS_TINTS[(lap - 1) % ENDLESS_TINTS.size()]
+	backdrop.modulate = tint
 
 
 func _player_step_time() -> float:
-	return PLAYER_STEP_TIME * 2.0 / LevelDataClass.speed(state.level_index)
+	return state.player_step_time()
 
 
 func _enemy_step_time() -> float:
-	return ENEMY_STEP_TIME * 2.0 / LevelDataClass.speed(state.level_index)
+	return state.enemy_step_time()
+
+
+func _enemy_step_time_for_kind(kind: StringName) -> float:
+	return state.enemy_step_time_for_kind(kind)
 
 
 func _filter_step_time() -> float:
-	return FILTER_STEP_TIME * 2.0 / LevelDataClass.speed(state.level_index)
+	return state.filter_step_time()
 
 
 func _reset_level_view() -> void:
@@ -316,6 +479,8 @@ func _reset_level_view() -> void:
 	player_hit_until = 0.0
 	move_cooldown = 0.0
 	enemy_cooldown = _enemy_step_time()
+	teapot_cooldown = _enemy_step_time_for_kind(&"teapot")
+	ultra_cooldown = _enemy_step_time_for_kind(&"ultra")
 	filter_cooldown = _filter_step_time()
 	_refresh()
 
@@ -326,10 +491,16 @@ func _hero_node() -> Node2D:
 	return _art_node(texture, 52.0, Rect2(Vector2.ZERO, frame_size))
 
 
-func _enemy_node() -> Node2D:
-	var texture: Texture2D = load("res://assets/art/source/tea-filter-sheet-v2.png")
+func _enemy_node(kind: StringName) -> Node2D:
+	var texture: Texture2D = load(ENEMY_TEXTURES[kind])
 	var frame_size := texture.get_size() / 2.0
-	return _art_node(texture, 44.0, Rect2(Vector2.ZERO, frame_size))
+	var node := _art_node(texture, ENEMY_SIZES[kind], Rect2(Vector2.ZERO, frame_size))
+	node.set_meta(&"enemy_kind", kind)
+	return node
+
+
+func _enemy_kind(enemy_index: int) -> StringName:
+	return state.enemy_kind(enemy_index)
 
 
 func _bean_variant(value: Variant) -> int:
@@ -337,7 +508,8 @@ func _bean_variant(value: Variant) -> int:
 
 
 func _update_enemy_frame(enemy_node: Node2D, enemy_index: int) -> void:
-	var texture: Texture2D = load("res://assets/art/source/tea-filter-sheet-v2.png")
+	var kind: StringName = enemy_node.get_meta(&"enemy_kind", &"teapod")
+	var texture: Texture2D = load(ENEMY_TEXTURES[kind])
 	var frame_size := texture.get_size() / 2.0
 	var cycle := int(floor(elapsed * 5.0 + enemy_index * 1.7)) % 16
 	var frame := Vector2i.ZERO
@@ -345,8 +517,16 @@ func _update_enemy_frame(enemy_node: Node2D, enemy_index: int) -> void:
 		frame = Vector2i(1, 0)
 	elif cycle in [4, 8, 12]:
 		frame = Vector2i(0, 1)
-	elif cycle == 15:
+	elif cycle == 15 and kind == &"teapod":
 		frame = Vector2i(1, 1)
+	_set_enemy_frame(enemy_node, frame, frame_size)
+
+
+func _set_enemy_frame(enemy_node: Node2D, frame: Vector2i, frame_size := Vector2.ZERO) -> void:
+	if frame_size == Vector2.ZERO:
+		var kind: StringName = enemy_node.get_meta(&"enemy_kind", &"teapod")
+		var texture: Texture2D = load(ENEMY_TEXTURES[kind])
+		frame_size = texture.get_size() / 2.0
 	var region := Rect2(Vector2(frame) * frame_size, frame_size)
 	for sprite in enemy_node.get_children():
 		if sprite is Sprite2D:
@@ -388,6 +568,17 @@ func _animate_player() -> void:
 		var breath := sin(elapsed * 3.2) * 0.012
 		player_node.scale = Vector2(1.0 - breath * 0.5, 1.0 + breath)
 		player_node.rotation = 0.0
+
+
+# Teleports (a pod climbing back out of the nest) must not be tweened across
+# the board from wherever the sprite happened to be.
+func _snap_actor(actor: Node2D, cell: Vector2i) -> void:
+	if actor.has_meta(&"move_tween"):
+		var previous_tween: Tween = actor.get_meta(&"move_tween")
+		if previous_tween and previous_tween.is_valid():
+			previous_tween.kill()
+	actor.position = _cell_position(cell).round()
+	actor.set_meta(&"target_cell", cell)
 
 
 func _move_actor(actor: Node2D, cell: Vector2i, duration: float) -> void:
@@ -454,13 +645,22 @@ func _on_game_event(kind: StringName, cell: Vector2i) -> void:
 		player_hit_until = elapsed + 0.7
 		_play_player_hit(cell)
 		_shake(9.0)
+		audio.play(&"life_lost")
 		modulate = Color("ff9a8b")
 		var tween := create_tween()
 		tween.tween_property(self, "modulate", Color.WHITE, 0.22)
 	elif kind == &"enemy_squashed":
 		_play_enemy_squash(cell)
-		_shake(5.0)
-		_pop_score(cell, GameStateClass.ENEMY_SQUASH_SCORE, Color("ffe6a8"))
+		# A drop that catches a second pod is the payoff moment, so it hits harder
+		# and sounds a step higher than the first.
+		var points := state.last_squash_score
+		var chained := points > GameStateClass.ENEMY_SQUASH_SCORE
+		_shake(8.0 if chained else 5.0)
+		audio.play(&"squash", 1.25 if chained else 1.0)
+		_pop_score(cell, points, Color("ffc857") if chained else Color("ffe6a8"))
+	elif kind == &"enemy_respawned":
+		audio.play(&"enemy_respawn")
+		_spawn_impact_specks(cell, Color("d8c7a0"))
 	elif kind == &"coffee":
 		var tier := 0
 		if bean_nodes.has(cell):
@@ -468,18 +668,34 @@ func _on_game_event(kind: StringName, cell: Vector2i) -> void:
 			tier = bean.get_meta(&"tier", 0)
 			bean_nodes.erase(cell)
 			_pop_bean(bean)
+		audio.play(&"coffee", 1.0 + tier * 0.11)
 		_pop_score(cell, LevelDataClass.bean_value(tier), Color("ffd27a"))
 	elif kind == &"dug":
 		_spawn_dust(cell)
+		# Every step digs, so the scrape is detuned a little to stop it droning.
+		audio.play(&"dig", randf_range(0.88, 1.14))
 	elif kind == &"filter_landed":
 		_spawn_dust(cell)
 		_shake(4.0)
+		audio.play(&"filter_land", randf_range(0.92, 1.08))
 	elif kind == &"won":
 		_play_level_clear()
+		audio.play(&"level_clear")
 	elif kind == &"close_call":
 		_play_close_call(cell)
+		audio.play(&"close_call")
 	elif kind == &"life_gained":
+		audio.play(&"life_gained")
 		_pop_score(cell, 0, Color("9ef0a0"), "EXTRA LIFE")
+	elif kind == &"level_reshuffled":
+		# Everything teleports, so the next refresh must snap instead of tween.
+		snap_next_refresh = true
+		_shake(11.0)
+		audio.play(&"reshuffle")
+		_pop_score(cell, 0, Color("9ed6f0"), "GROUND SHIFTS")
+	elif kind == &"game_over":
+		audio.play(&"life_lost", 0.72)
+		_show_game_over(_record_run())
 
 
 func _pop_score(cell: Vector2i, points: int, color: Color, text := "") -> void:
@@ -528,8 +744,16 @@ func _play_player_hit(cell: Vector2i) -> void:
 
 
 func _play_enemy_squash(cell: Vector2i) -> void:
-	var ghost := _enemy_node()
-	_update_enemy_frame(ghost, 0)
+	var kind := &"teapod"
+	for enemy_index in range(state.enemies.size()):
+		if state.enemies[enemy_index] == cell:
+			kind = _enemy_kind(enemy_index)
+			break
+	var ghost := _enemy_node(kind)
+	if kind == &"teapod":
+		_update_enemy_frame(ghost, 0)
+	else:
+		_set_enemy_frame(ghost, Vector2i(1, 1))
 	ghost.position = _cell_position(cell)
 	actors.add_child(ghost)
 	_spawn_impact_specks(cell, Color("a77b36"))
