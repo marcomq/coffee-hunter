@@ -5,6 +5,8 @@ const InputResolverClass = preload("res://scripts/input_resolver.gd")
 const LevelDataClass = preload("res://scripts/level_data.gd")
 const GameAudioClass = preload("res://scripts/audio.gd")
 const SaveDataClass = preload("res://scripts/save_data.gd")
+const MatchStateClass = preload("res://scripts/match_state.gd")
+const NetLinkClass = preload("res://scripts/net_link.gd")
 const TILE := 48
 const BOARD_ORIGIN := Vector2(12, 6)
 const BOARD_SIZE := Vector2(GameStateClass.WIDTH * TILE, GameStateClass.HEIGHT * TILE)
@@ -46,7 +48,12 @@ const LEVEL_BACKGROUND_TINTS := [
 # a repeat never reads as the same level.
 const ENDLESS_TINTS := [Color("bcd0ff"), Color("ffc4bc"), Color("c4f0c0"), Color("edc6ff")]
 
-enum UiMode { TITLE, PLAYING, PAUSED, GAME_OVER }
+enum UiMode { TITLE, LOBBY, PLAYING, PAUSED, GAME_OVER }
+
+# The host simulates and ships state at this rate; the client only draws. Actor
+# tweens already smooth between cells, so a faster stream would buy nothing.
+const SNAPSHOT_INTERVAL := 1.0 / 15.0
+const RIVAL_TINT := Color("9ed6f0")
 
 var state: GameState
 var resolver: InputResolver
@@ -62,6 +69,7 @@ var score_label: Label
 var lives_label: Label
 var beans_label: Label
 var status_label: Label
+var rival_label: Label
 var move_cooldown := 0.0
 var enemy_cooldown := ENEMY_STEP_TIME
 var teapot_cooldown := ENEMY_STEP_TIME
@@ -86,6 +94,26 @@ var best_label: Label
 var ui_mode := UiMode.TITLE
 var high_score := 0
 var best_level := 0
+# Null in single player. When set, `state` is a view onto one of its worlds.
+var match_state: MatchState
+var net: NetLink
+var local_player := 0
+var rival_node: Node2D
+var charge_ring: Line2D
+var shown_world := -1
+var snapshot_countdown := 0.0
+# The guest ships its intent every frame. The host stores the latest one and
+# walks it on its own step clock, otherwise one keypress would be one step per
+# packet.
+var remote_direction := Vector2i.ZERO
+var remote_throw := false
+var remote_move_cooldown := 0.0
+var portal_node: Node2D
+# A rematch starts only once both sides have said yes.
+var rematch_ready := false
+var rematch_remote := false
+var lobby_address: LineEdit
+var lobby_list: Label
 
 
 func _ready() -> void:
@@ -99,10 +127,15 @@ func _ready() -> void:
 	_build_background()
 	_build_tiles()
 	_build_hud()
+	portal_node = _build_portal()
+	board.add_child(portal_node)
 	board.add_child(actors)
 	shield_node = _build_shield()
 	actors.add_child(shield_node)
+	charge_ring = _build_charge_ring()
+	actors.add_child(charge_ring)
 	_build_overlay()
+	_build_net()
 	state.changed.connect(_refresh)
 	state.event_emitted.connect(_on_game_event)
 	_refresh()
@@ -162,6 +195,13 @@ func _build_hud() -> void:
 	best_label.position = Vector2(850, 214)
 	best_label.size = Vector2(102, 24)
 	add_child(best_label)
+	# Tinted like the rival sprite, so the two read as the same person.
+	rival_label = _label("", 16, RIVAL_TINT)
+	rival_label.position = Vector2(850, 250)
+	rival_label.size = Vector2(102, 88)
+	rival_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	rival_label.visible = false
+	add_child(rival_label)
 	status_label = _label("", 16, Color("d9efb3"))
 	status_label.position = Vector2(850, 252)
 	status_label.size = Vector2(102, 130)
@@ -197,6 +237,236 @@ func _build_overlay() -> void:
 	overlay_body.size = Vector2(960, 280)
 	overlay_body.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	overlay.add_child(overlay_body)
+	lobby_list = _label("", 16, Color("d9efb3"))
+	lobby_list.position = Vector2(0, 330)
+	lobby_list.size = Vector2(960, 120)
+	lobby_list.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lobby_list.visible = false
+	overlay.add_child(lobby_list)
+	lobby_address = LineEdit.new()
+	lobby_address.position = Vector2(330, 452)
+	lobby_address.size = Vector2(300, 34)
+	lobby_address.placeholder_text = "IP eintippen (z.B. 192.168.1.20)"
+	lobby_address.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lobby_address.visible = false
+	lobby_address.text_submitted.connect(_on_address_submitted)
+	overlay.add_child(lobby_address)
+
+
+func _build_net() -> void:
+	net = NetLinkClass.new()
+	net.name = "NetLink"
+	add_child(net)
+	net.lobby_changed.connect(_refresh_lobby_list)
+	net.link_ready.connect(_on_link_ready)
+	net.link_lost.connect(_on_link_lost)
+	net.match_started.connect(_on_match_started)
+	net.snapshot_received.connect(_on_snapshot_received)
+	net.event_received.connect(_on_remote_event)
+	net.input_received.connect(_on_remote_input)
+	net.rematch_requested.connect(_on_rematch_requested)
+
+
+func _show_lobby() -> void:
+	ui_mode = UiMode.LOBBY
+	overlay.visible = true
+	overlay_title.text = "ZWEI PLANTAGEN"
+	overlay_body.text = "Ein Wettrennen um die Bohnen, verbunden durch ein Portal.\n\nH  Spiel hosten und auf einen Gegner warten\nESC  zurueck zum Titel"
+	lobby_list.visible = true
+	lobby_address.visible = true
+	net.start_browsing()
+	_refresh_lobby_list()
+
+
+func _hide_lobby_widgets() -> void:
+	lobby_list.visible = false
+	lobby_address.visible = false
+	if net:
+		net.stop_browsing()
+
+
+func _refresh_lobby_list() -> void:
+	if ui_mode != UiMode.LOBBY:
+		return
+	if net.found_games.is_empty():
+		lobby_list.text = "Suche im lokalen Netz...\n(oder unten ins Feld klicken, Adresse eintippen, ENTER)"
+		return
+	var lines := "Gefundene Spiele - Zifferntaste zum Beitreten:\n"
+	for index in range(mini(net.found_games.size(), 9)):
+		var entry: Dictionary = net.found_games[index]
+		lines += "%d)  %s   %s\n" % [index + 1, entry["name"], entry["address"]]
+	lobby_list.text = lines
+
+
+func _on_address_submitted(address: String) -> void:
+	if address.strip_edges() == "":
+		return
+	if not net.join(address):
+		overlay_body.text = net.status_text
+		return
+	overlay_body.text = net.status_text
+
+
+# Both sides land here once the link stands. The host owns the seed and tells the
+# guest, so that both grow the very same pair of plantations.
+func _on_link_ready(player_index: int) -> void:
+	local_player = player_index
+	_hide_lobby_widgets()
+	if net.is_host():
+		var seed_value := randi() & 0x7fffffff
+		_begin_match(seed_value)
+		net.broadcast_match_start(seed_value)
+	else:
+		overlay_title.text = "VERBUNDEN"
+		overlay_body.text = "Warte auf den Host..."
+
+
+func _on_match_started(seed_value: int) -> void:
+	local_player = net.local_player_index()
+	_begin_match(seed_value)
+
+
+func _begin_match(seed_value: int) -> void:
+	audio.play(&"start")
+	ui_mode = UiMode.PLAYING
+	overlay.visible = false
+	_hide_lobby_widgets()
+	match_state = MatchStateClass.new(seed_value)
+	match_state.event_emitted.connect(_on_match_event)
+	match_state.finished.connect(_on_match_finished)
+	match_state.start_game()
+	shown_world = -1
+	snapshot_countdown = 0.0
+	remote_direction = Vector2i.ZERO
+	remote_throw = false
+	remote_move_cooldown = 0.0
+	rematch_ready = false
+	rematch_remote = false
+	_switch_to_world(match_state.world_of_player[local_player])
+
+
+func _on_link_lost(reason: String) -> void:
+	match_state = null
+	_show_title()
+	overlay_title.text = "VERBINDUNG WEG"
+	overlay_body.text = "%s\n\nSPACE fuer einen neuen Anlauf      ESC fuer den Titel" % reason
+
+
+func _on_snapshot_received(payload: PackedByteArray) -> void:
+	if match_state == null:
+		return
+	match_state.apply_bytes(payload)
+	var world_index: int = match_state.world_of_player[local_player]
+	if world_index != shown_world:
+		_switch_to_world(world_index)
+	else:
+		_refresh()
+
+
+# Intent only: acting on it here would step the guest once per arriving packet,
+# which is 60 steps a second. `_process_match` spends it on the step clock.
+func _on_remote_input(player_index: int, direction: Vector2i, throw_pressed: bool) -> void:
+	if match_state == null or not net.is_host() or player_index == local_player:
+		return
+	remote_direction = direction
+	# Latched: the press lives for one client frame, the host consumes it on its
+	# next tick.
+	remote_throw = remote_throw or throw_pressed
+
+
+func _on_remote_event(kind: StringName, cell: Vector2i, world_index: int, player_index: int) -> void:
+	_on_match_event(kind, cell, world_index, player_index)
+
+
+# Only what happens on the board being drawn may fire sound and particles; the
+# rival plantation ticks away off-screen and must stay silent.
+func _on_match_event(kind: StringName, cell: Vector2i, world_index: int, player_index: int) -> void:
+	if net != null and net.is_host():
+		net.broadcast_event(kind, cell, world_index, player_index)
+	if world_index != shown_world:
+		return
+	_on_game_event(kind, cell, player_index)
+
+
+func _on_match_finished(winner: int) -> void:
+	if match_state == null:
+		return
+	ui_mode = UiMode.GAME_OVER
+	overlay.visible = true
+	rematch_ready = false
+	rematch_remote = false
+	if winner < 0:
+		overlay_title.text = "UNENTSCHIEDEN"
+	elif winner == local_player:
+		overlay_title.text = "GEWONNEN"
+	else:
+		overlay_title.text = "VERLOREN"
+	# The host stops simulating the moment the overlay is up, so the snapshot
+	# that carries `is_over` has to go out now - the next scheduled one never
+	# comes, and without it the guest keeps staring at a frozen board.
+	if net != null and net.is_host():
+		net.broadcast_snapshot(match_state.to_bytes())
+	_show_match_result()
+
+
+func _show_match_result() -> void:
+	if match_state == null:
+		return
+	var mine: PlayerSlot = match_state.players[local_player]
+	var theirs: PlayerSlot = match_state.players[1 - local_player]
+	overlay_body.text = "DU  %d Punkte, %d Leben      GEGNER  %d Punkte, %d Leben\n\n%s" % [
+		mine.score, mine.lives, theirs.score, theirs.lives, _rematch_line(),
+	]
+
+
+func _rematch_line() -> String:
+	if net == null or not net.is_online():
+		return "SPACE fuer einen neuen Anlauf      ESC fuer den Titel"
+	var mine := "bereit" if rematch_ready else "SPACE druecken"
+	var theirs := "bereit" if rematch_remote else "wartet noch"
+	return "REVANCHE - beide muessen bestaetigen\nDu: %s      Gegner: %s\n\nESC fuer den Titel" % [mine, theirs]
+
+
+# Announcing is all a guest can do; the seed belongs to the host.
+func _request_rematch() -> void:
+	if rematch_ready or net == null or not net.is_online():
+		return
+	rematch_ready = true
+	net.send_rematch()
+	_show_match_result()
+	_start_rematch_if_agreed()
+
+
+func _on_rematch_requested() -> void:
+	if ui_mode != UiMode.GAME_OVER or match_state == null:
+		return
+	rematch_remote = true
+	_show_match_result()
+	_start_rematch_if_agreed()
+
+
+func _start_rematch_if_agreed() -> void:
+	if not rematch_ready or not rematch_remote or not net.is_host():
+		return
+	var seed_value := randi() & 0x7fffffff
+	_begin_match(seed_value)
+	net.broadcast_match_start(seed_value)
+
+
+# The rendered world is swapped wholesale on a portal hop: every actor teleports,
+# so nothing may tween across the board from its old position.
+func _switch_to_world(world_index: int) -> void:
+	if match_state == null:
+		return
+	if state != null:
+		if state.changed.is_connected(_refresh):
+			state.changed.disconnect(_refresh)
+		if state.event_emitted.is_connected(_on_game_event):
+			state.event_emitted.disconnect(_on_game_event)
+	shown_world = world_index
+	state = match_state.worlds[world_index]
+	state.changed.connect(_refresh)
+	_reset_level_view()
 
 
 func _show_title() -> void:
@@ -206,7 +476,7 @@ func _show_title() -> void:
 	var record := "NO RUN RECORDED YET"
 	if high_score > 0:
 		record = "BEST  %d      FURTHEST  LEVEL %d" % [high_score, best_level + 1]
-	overlay_body.text = "Grounds for Adventure\n\n%s\n\nWASD or ARROWS to dig, or drag the mouse to tilt\nShove a coffee filter onto a tea-pod to squash it\nCatch several pods in one drop and the payout doubles\n\nP pause      R restart      M mute      ESC title\n\nPRESS SPACE TO START" % record
+	overlay_body.text = "Grounds for Adventure\n\n%s\n\nWASD or ARROWS to dig, or drag the mouse to tilt\nShove a coffee filter onto a tea-pod to squash it\nCatch several pods in one drop and the payout doubles\n\nP pause      R restart      M mute      ESC title\n\nSPACE  Einzelspieler      N  Netzwerk-Wettrennen" % record
 
 
 func _show_game_over(is_record: bool) -> void:
@@ -256,12 +526,21 @@ func _handle_ui_input() -> bool:
 	if ui_mode == UiMode.TITLE:
 		if Input.is_action_just_pressed("confirm"):
 			_begin_run()
+		elif Input.is_key_pressed(KEY_N):
+			_show_lobby()
+		return true
+	if ui_mode == UiMode.LOBBY:
+		_handle_lobby_input()
 		return true
 	if ui_mode == UiMode.GAME_OVER:
-		if Input.is_action_just_pressed("confirm") or Input.is_action_just_pressed("restart"):
-			_begin_run()
-		elif Input.is_action_just_pressed("to_title"):
+		if Input.is_action_just_pressed("to_title"):
+			_leave_match()
 			_show_title()
+		elif Input.is_action_just_pressed("confirm") or Input.is_action_just_pressed("restart"):
+			if match_state != null:
+				_request_rematch()
+			else:
+				_begin_run()
 		return true
 	if ui_mode == UiMode.PAUSED:
 		if Input.is_action_just_pressed("pause") or Input.is_action_just_pressed("confirm"):
@@ -271,16 +550,60 @@ func _handle_ui_input() -> bool:
 		elif Input.is_action_just_pressed("to_title"):
 			_show_title()
 		return true
+	if Input.is_action_just_pressed("to_title"):
+		_leave_match()
+		_show_title()
+		return true
+	if match_state != null:
+		return false
 	if Input.is_action_just_pressed("pause"):
 		_set_paused(true)
-		return true
-	if Input.is_action_just_pressed("to_title"):
-		_show_title()
 		return true
 	if Input.is_action_just_pressed("restart"):
 		_begin_run()
 		return true
 	return false
+
+
+func _handle_lobby_input() -> void:
+	if Input.is_action_just_pressed("to_title"):
+		_hide_lobby_widgets()
+		_show_title()
+		return
+	# The address field swallows typing, so the shortcuts only fire when it is
+	# not the focused control - which is why the lobby opens with nothing focused
+	# and the field only takes focus once it is clicked.
+	if lobby_address.has_focus():
+		return
+	# Raw keys have no just_pressed helper: without this a held key would rebuild
+	# the peer every frame.
+	if net.is_online():
+		return
+	if Input.is_key_pressed(KEY_H):
+		if net.host():
+			overlay_body.text = net.status_text
+		else:
+			overlay_body.text = net.status_text
+		return
+	for slot in range(mini(net.found_games.size(), 9)):
+		if Input.is_key_pressed(KEY_1 + slot):
+			var entry: Dictionary = net.found_games[slot]
+			net.join(String(entry["address"]))
+			overlay_body.text = net.status_text
+			return
+
+
+func _leave_match() -> void:
+	if net != null and net.is_online():
+		net.disconnect_link()
+	rematch_ready = false
+	rematch_remote = false
+	match_state = null
+	shown_world = -1
+	state = GameStateClass.new()
+	state.changed.connect(_refresh)
+	state.event_emitted.connect(_on_game_event)
+	_reset_level_view()
 
 
 func _process(delta: float) -> void:
@@ -300,6 +623,9 @@ func _process(delta: float) -> void:
 			_update_enemy_frame(enemy_node, enemy_index)
 	_update_shake(delta)
 	_animate_filters()
+	_update_rival_node()
+	_update_charge_ring()
+	_animate_portal()
 	queue_redraw()
 
 
@@ -312,6 +638,12 @@ func _physics_process(delta: float) -> void:
 		return
 
 	var direction := resolver.direction_from_vector(resolver.combined_vector(virtual_tilt))
+	var throw_pressed := Input.is_action_just_pressed("throw")
+	if match_state != null:
+		_process_match(delta, direction, throw_pressed)
+		queue_redraw()
+		return
+
 	if state.phase == GameStateClass.Phase.WON and direction != Vector2i.ZERO:
 		_record_run()
 		if state.next_level():
@@ -391,7 +723,7 @@ func _refresh() -> void:
 		player_node = _hero_node()
 		actors.add_child(player_node)
 	_update_hero_frame()
-	_move_actor(player_node, state.player, _player_step_time())
+	_move_actor(player_node, _local_slot().cell, _player_step_time())
 
 	while enemy_nodes.size() < state.enemies.size():
 		var enemy_node := _enemy_node(_enemy_kind(enemy_nodes.size()))
@@ -427,12 +759,20 @@ func _refresh() -> void:
 		_move_actor(filter_node, filter_cell, filter_duration)
 	snap_next_refresh = false
 
-	score_label.text = "SCORE  %d" % state.score
-	lives_label.text = "LIVES  %d" % state.lives
+	var shown_slot := _local_slot()
+	score_label.text = "SCORE  %d" % shown_slot.score
+	lives_label.text = "LIVES  %d" % shown_slot.lives
 	beans_label.text = "BEANS  %d" % state.beans.size()
-	best_label.text = "BEST  %d" % maxi(high_score, state.score)
+	best_label.text = "BEST  %d" % maxi(high_score, shown_slot.score)
 	if audio and audio.muted:
 		best_label.text += "   MUTED"
+	# The rival panel drops in above the controls, so the controls move down.
+	rival_label.visible = match_state != null
+	status_label.position.y = 348.0 if match_state != null else 252.0
+	if match_state != null:
+		var rival: PlayerSlot = match_state.players[1 - local_player]
+		var where := "HIER!" if match_state.world_of_player[1 - local_player] == shown_world else "DRUEBEN"
+		rival_label.text = "GEGNER\nSCORE  %d\nLEBEN  %d\n%s" % [rival.score, rival.lives, where]
 	match state.phase:
 		GameStateClass.Phase.READY:
 			status_label.text = "PRESS A DIRECTION\nTO START\n\nWASD / ARROWS\nor drag to tilt"
@@ -447,7 +787,10 @@ func _refresh() -> void:
 			var level_line := "LEVEL %d" % (state.level_index + 1)
 			if LevelDataClass.is_endless(state.level_index):
 				level_line += "  ENDLESS"
-			status_label.text = "%s\nSPEED %.1f\n\nWASD / ARROWS\nDrag mouse to tilt\n\nP pause  R restart" % [level_line, LevelDataClass.speed(state.level_index)]
+			if match_state != null:
+				status_label.text = "%s\n\nF  KAFFEE\nWERFEN\n\nESC  ENDE" % level_line
+			else:
+				status_label.text = "%s\nSPEED %.1f\n\nWASD / ARROWS\nDrag mouse to tilt\n\nP pause  R restart" % [level_line, LevelDataClass.speed(state.level_index)]
 
 
 func _update_level_background() -> void:
@@ -463,6 +806,24 @@ func _update_level_background() -> void:
 	if lap > 0:
 		tint *= ENDLESS_TINTS[(lap - 1) % ENDLESS_TINTS.size()]
 	backdrop.modulate = tint
+
+
+# The hero on screen is always the LOCAL player's slot. `state.player` is the
+# shown board's first slot instead, which stops being the same thing the moment
+# one side steps through the portal and both stand on one plantation.
+func _local_slot() -> PlayerSlot:
+	if match_state != null:
+		return match_state.players[local_player]
+	return state.players[0]
+
+
+# Where that slot sits in the shown board's own player list. Falls back to 0 for
+# the frame between a portal hop and the view swapping to the other plantation,
+# when the slot is not on the drawn board at all.
+func _local_board_index() -> int:
+	if match_state == null:
+		return 0
+	return maxi(state.players.find(_local_slot()), 0)
 
 
 func _player_step_time() -> float:
@@ -498,6 +859,7 @@ func _reset_level_view() -> void:
 		player_node.rotation = 0.0
 	player_hit_until = 0.0
 	move_cooldown = 0.0
+	remote_move_cooldown = 0.0
 	enemy_cooldown = _enemy_step_time()
 	teapot_cooldown = _enemy_step_time_for_kind(&"teapot")
 	ultra_cooldown = _enemy_step_time_for_kind(&"ultra")
@@ -559,7 +921,7 @@ func _set_enemy_frame(enemy_node: Node2D, frame: Vector2i, frame_size := Vector2
 
 
 func _update_hero_frame() -> void:
-	_set_hero_frame(player_node, state.player_facing)
+	_set_hero_frame(player_node, _local_slot().facing)
 
 
 func _set_hero_frame(hero: Node2D, facing: Vector2i, walk_frame := 0) -> void:
@@ -588,11 +950,11 @@ func _animate_player() -> void:
 		var walk_cycle := [1, 2, 3, 2]
 		var progress := _actor_move_progress(player_node)
 		var frame_index := mini(int(progress * walk_cycle.size()), walk_cycle.size() - 1)
-		_set_hero_frame(player_node, state.player_facing, walk_cycle[frame_index])
+		_set_hero_frame(player_node, _local_slot().facing, walk_cycle[frame_index])
 		player_node.scale = Vector2.ONE
 		player_node.rotation = 0.0
 	else:
-		_set_hero_frame(player_node, state.player_facing)
+		_set_hero_frame(player_node, _local_slot().facing)
 		var breath := sin(elapsed * 3.2) * 0.012
 		player_node.scale = Vector2(1.0 - breath * 0.5, 1.0 + breath)
 		player_node.rotation = 0.0
@@ -718,7 +1080,7 @@ func _cell_position(cell: Vector2i) -> Vector2:
 	return BOARD_ORIGIN + (Vector2(cell) + Vector2(0.5, 0.5)) * TILE
 
 
-func _on_game_event(kind: StringName, cell: Vector2i) -> void:
+func _on_game_event(kind: StringName, cell: Vector2i, _player_index: int) -> void:
 	if kind == &"life_lost":
 		snap_next_refresh = true
 		player_hit_until = elapsed + 0.7
@@ -802,7 +1164,7 @@ func _play_player_hit(cell: Vector2i) -> void:
 	if is_instance_valid(player_node):
 		player_node.visible = false
 	var ghost := _hero_node()
-	_set_hero_frame(ghost, state.player_facing)
+	_set_hero_frame(ghost, _local_slot().facing)
 	ghost.position = _cell_position(cell)
 	ghost.modulate = Color("ffb09f")
 	actors.add_child(ghost)
@@ -869,6 +1231,103 @@ func _draw() -> void:
 	draw_rect(border, Color("5e3726"), false, 2.0)
 
 
+# There is no art for the portal, so it is drawn: a translucent disc under two
+# counter-turning rings. Only a match has one, hence hidden by default.
+func _build_portal() -> Node2D:
+	var node := Node2D.new()
+	node.visible = false
+	var disc := Polygon2D.new()
+	disc.polygon = _ring_points(19.0)
+	disc.color = Color(0.42, 0.78, 0.98, 0.22)
+	node.add_child(disc)
+	var outer := Line2D.new()
+	outer.points = _ring_points(20.0)
+	outer.closed = true
+	outer.width = 3.0
+	outer.default_color = Color("7fd8ff")
+	node.add_child(outer)
+	var inner := Line2D.new()
+	inner.points = _ring_points(12.0)
+	inner.closed = true
+	inner.width = 2.0
+	inner.default_color = Color("c9a8ff")
+	node.add_child(inner)
+	return node
+
+
+func _ring_points(radius: float) -> PackedVector2Array:
+	var points := PackedVector2Array()
+	for step in range(16):
+		var angle := TAU * float(step) / 16.0
+		points.append(Vector2(cos(angle), sin(angle)) * radius)
+	return points
+
+
+func _animate_portal() -> void:
+	portal_node.visible = match_state != null and state != null
+	if not portal_node.visible:
+		return
+	# Both boards grow from one seed, so the shown world always has the twin cell.
+	portal_node.position = _cell_position(state.portal_cell())
+	portal_node.get_child(0).scale = Vector2.ONE * (1.0 + sin(elapsed * 2.6) * 0.08)
+	portal_node.get_child(1).rotation = elapsed * 0.9
+	portal_node.get_child(2).rotation = -elapsed * 1.4
+
+
+# Deliberately an arc rather than a bar: it reads at a glance how much of the
+# throw is brewed without pulling the eye off the board.
+func _build_charge_ring() -> Line2D:
+	var ring := Line2D.new()
+	ring.width = 4.0
+	ring.default_color = Color("c9a227")
+	ring.visible = false
+	ring.z_index = 4
+	return ring
+
+
+func _update_charge_ring() -> void:
+	if match_state == null or not is_instance_valid(player_node) or not player_node.visible:
+		charge_ring.visible = false
+		return
+	var ratio := match_state.charge_ratio(local_player)
+	charge_ring.visible = ratio > 0.01
+	if not charge_ring.visible:
+		return
+	var points := PackedVector2Array()
+	var steps := maxi(int(ratio * 24.0), 1)
+	for step in range(steps + 1):
+		var angle := -PI * 0.5 + TAU * ratio * float(step) / float(steps)
+		points.append(Vector2(cos(angle), sin(angle)) * 26.0)
+	charge_ring.points = points
+	charge_ring.position = player_node.position
+	var armed := match_state.is_armed(local_player)
+	charge_ring.default_color = Color("9ef0a0") if armed else Color("c9a227")
+	charge_ring.width = 5.0 if armed else 3.0
+	if armed:
+		charge_ring.modulate = Color(1, 1, 1, 0.65 + 0.35 * absf(sin(elapsed * 6.0)))
+	else:
+		charge_ring.modulate = Color.WHITE
+
+
+# The rival only exists on screen while standing on the board being drawn.
+func _update_rival_node() -> void:
+	if match_state == null:
+		if is_instance_valid(rival_node):
+			rival_node.visible = false
+		return
+	var rival: PlayerSlot = match_state.players[1 - local_player]
+	var here := match_state.world_of_player[1 - local_player] == shown_world
+	if not is_instance_valid(rival_node):
+		rival_node = _hero_node()
+		rival_node.modulate = RIVAL_TINT
+		actors.add_child(rival_node)
+	rival_node.visible = here
+	if not here:
+		return
+	_set_hero_frame(rival_node, rival.facing)
+	_move_actor(rival_node, rival.cell, _player_step_time())
+
+
 func _build_shield() -> Line2D:
 	var ring := Line2D.new()
 	var points := PackedVector2Array()
@@ -887,10 +1346,10 @@ func _build_shield() -> Line2D:
 func _animate_invulnerability() -> void:
 	if not is_instance_valid(player_node):
 		return
-	var invulnerable := state.is_invulnerable() and player_node.visible
+	var invulnerable := state.is_invulnerable(_local_board_index()) and player_node.visible
 	shield_node.visible = invulnerable
 	if invulnerable:
-		var left := state.invulnerability_left()
+		var left := state.invulnerability_left(_local_board_index())
 		var urgency := 1.0 - clampf(left / GameStateClass.RESPAWN_INVULNERABILITY, 0.0, 1.0)
 		var blink := sin(elapsed * (15.0 + urgency * 30.0))
 		player_node.modulate = Color("ffe6a8") if blink > 0.0 else Color(1, 1, 1, 0.2)
@@ -967,3 +1426,71 @@ func _play_level_clear() -> void:
 		var burst_tween := create_tween()
 		burst_tween.tween_interval(delay)
 		burst_tween.tween_callback(_spawn_impact_specks.bind(cell, Color("ffd27a")))
+
+
+# A client never simulates. It posts its intent and draws whatever the host sends
+# back, which is what keeps the two screens telling the same story.
+func _process_match(delta: float, direction: Vector2i, throw_pressed: bool) -> void:
+	if not net.is_host():
+		net.send_input(direction, throw_pressed)
+		return
+
+	if throw_pressed:
+		match_state.throw_coffee(local_player)
+	match_state.advance_time(delta)
+	for world in match_state.worlds:
+		world.tick_contacts()
+
+	move_cooldown -= delta
+	remote_move_cooldown -= delta
+	enemy_cooldown -= delta
+	teapot_cooldown -= delta
+	ultra_cooldown -= delta
+	filter_cooldown -= delta
+
+	if move_cooldown <= 0.0 and elapsed >= player_hit_until:
+		if match_state.move_player(local_player, direction):
+			move_cooldown += _player_step_time()
+			var world_index: int = match_state.world_of_player[local_player]
+			if world_index != shown_world:
+				_switch_to_world(world_index)
+		else:
+			move_cooldown = 0.0
+
+	# The guest walks on the same clock as the host, just from stored intent.
+	var remote_player := 1 - local_player
+	if remote_throw:
+		remote_throw = false
+		match_state.throw_coffee(remote_player)
+	if remote_move_cooldown <= 0.0:
+		if match_state.move_player(remote_player, remote_direction):
+			remote_move_cooldown += _player_step_time()
+		else:
+			remote_move_cooldown = 0.0
+
+	# Both plantations keep running, so a raider cannot freeze the board they left.
+	if enemy_cooldown <= 0.0:
+		for world in match_state.worlds:
+			world.tick_enemy(&"teapod")
+		enemy_cooldown += _enemy_step_time()
+	if teapot_cooldown <= 0.0:
+		for world in match_state.worlds:
+			world.tick_enemy(&"teapot")
+		teapot_cooldown += _enemy_step_time_for_kind(&"teapot")
+	if ultra_cooldown <= 0.0:
+		for world in match_state.worlds:
+			world.tick_enemy(&"ultra")
+		ultra_cooldown += _enemy_step_time_for_kind(&"ultra")
+	if filter_cooldown <= 0.0:
+		for world in match_state.worlds:
+			world.tick_filter()
+		filter_cooldown += _filter_step_time()
+
+	for world_index in range(match_state.worlds.size()):
+		if match_state.worlds[world_index].phase == GameStateClass.Phase.WON:
+			match_state.next_level(world_index)
+
+	snapshot_countdown -= delta
+	if snapshot_countdown <= 0.0:
+		snapshot_countdown += SNAPSHOT_INTERVAL
+		net.broadcast_snapshot(match_state.to_bytes())

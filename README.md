@@ -54,6 +54,42 @@ godot --path .
 
 Controls: WASD or arrow keys. Hold and drag the left mouse button to simulate device tilt. Press `R` to restart.
 
+## Two Plantations (network match)
+
+Press `N` on the title screen for a competitive two-player race. Both plantations
+are grown from one shared seed, so the two boards are identical and the race is
+fair. A portal on the branch corner links them - the turning blue ring on the
+board: step onto it to raid your rival's field, where beans you pick count for
+*your* score and a shoved coffee filter is as lethal to a player as it is to a
+tea-pod.
+
+Standing still for three seconds brews a coffee; `F` (or `Ctrl`) throws it, which
+the side panel spells out during a match. Walking spills a half-brewed mug, but a
+full one keeps until it is thrown. It flies two cells along your facing, stops at
+undug soil, and a hit takes half the rival's score and one life. A portal hop
+banks two of the three seconds, so raiding arrives nearly armed. Stolen points never buy extra lives - only beans
+you picked yourself count toward those.
+
+The side panel keeps the rival's score, lives and whether they are standing on
+your board in view the whole time.
+
+The match runs over `MATCH_LEVELS` levels, or ends early when someone runs out of
+lives. The end screen offers a rematch that takes *both* sides: each presses
+SPACE, the panel shows who has already agreed, and the host starts the next race
+on a fresh seed once the second one does. ESC leaves for the title and drops the
+link.
+
+### Connecting
+
+The host is found automatically on the local network - press `H` to host, then
+pick the game from the list with a number key. Typing an address works too: click
+the field first, since a focused field swallows the shortcuts. That is what covers
+`127.0.0.1` for a local test and a Tailscale/ZeroTier address for playing over the
+internet without port forwarding or a relay.
+
+Two instances on one machine do not see each other in the list - both would need
+the same discovery port - so join the second one by typing `127.0.0.1`.
+
 The level runs continuously: enemies and falling filters use independent realtime clocks instead of advancing only when the player moves.
 
 On macOS the game opens at 1440x810 by default while retaining its 960x540 internal canvas.

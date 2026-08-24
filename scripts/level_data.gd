@@ -28,6 +28,10 @@ const MAX_TEA_PODS := 12
 # One extra bean per endless level until the board would get too crowded.
 const ENDLESS_BEAN_STEPS := 20
 
+# A competitive match is decided over this many levels per player; the endless
+# ramp above still applies, a match just stops climbing it at some point.
+const MATCH_LEVELS := 3
+
 # Tea pots enter after the first two introductory levels.
 const TEAPOT_FIRST_LEVEL := 2
 

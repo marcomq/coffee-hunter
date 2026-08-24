@@ -5,6 +5,8 @@ const InputResolverClass = preload("res://scripts/input_resolver.gd")
 const LevelDataClass = preload("res://scripts/level_data.gd")
 const GameAudioClass = preload("res://scripts/audio.gd")
 const SaveDataClass = preload("res://scripts/save_data.gd")
+const MatchStateClass = preload("res://scripts/match_state.gd")
+const NetLinkClass = preload("res://scripts/net_link.gd")
 var failures := 0
 
 
@@ -56,6 +58,25 @@ func _init() -> void:
 	_test_filter_stays_on_the_bottom_edge_after_a_push()
 	_test_filter_push_blockers()
 	_test_win()
+	_test_both_worlds_share_a_layout()
+	_test_portal_moves_a_player_and_tops_up_the_charge()
+	_test_charge_fills_in_three_seconds_and_survives_a_step()
+	_test_throw_needs_a_full_charge()
+	_test_throw_only_reaches_two_cells_along_the_facing()
+	_test_throw_is_blocked_by_soil()
+	_test_a_hit_steals_half_the_score_and_a_life()
+	_test_stolen_points_never_buy_an_extra_life()
+	_test_a_robbed_player_keeps_their_extra_life_progress()
+	_test_throw_does_nothing_to_an_invulnerable_rival()
+	_test_enemies_hunt_the_nearest_player()
+	_test_deadlock_check_pauses_when_the_owner_is_away()
+	_test_match_ends_when_a_player_runs_out_of_lives()
+	_test_snapshot_roundtrip_restores_the_match()
+	_test_snapshot_roundtrip_survives_a_player_mid_raid()
+	_test_net_link_compiles_and_starts_offline()
+	_test_a_finished_snapshot_ends_the_match_on_the_client()
+	_test_net_link_offers_a_rematch_handshake()
+	_test_throw_key_is_bound()
 	if failures == 0:
 		print("PASS: all Coffee Hunter tests")
 	quit(failures)
@@ -379,7 +400,7 @@ func _test_walled_in_bean_rebuilds_the_level() -> void:
 	_expect(not game.all_beans_reachable(), "a bean ringed by unpushable filters is unreachable")
 	# GDScript lambdas capture by value, so the flag has to live in a reference type.
 	var rebuilds: Array[Vector2i] = []
-	game.event_emitted.connect(func(kind: StringName, cell: Vector2i) -> void:
+	game.event_emitted.connect(func(kind: StringName, cell: Vector2i, _player_index: int) -> void:
 		if kind == &"level_reshuffled":
 			rebuilds.append(cell)
 	)
@@ -447,7 +468,7 @@ func _test_filter_landing_is_announced() -> void:
 	game.set_cell(Vector2i(4, corridor - 1), GameStateClass.Cell.TUNNEL)
 	game.set_cell(Vector2i(4, corridor + 1), GameStateClass.Cell.SOIL)
 	var landings: Array[Vector2i] = []
-	game.event_emitted.connect(func(kind: StringName, cell: Vector2i) -> void:
+	game.event_emitted.connect(func(kind: StringName, cell: Vector2i, _player_index: int) -> void:
 		if kind == &"filter_landed":
 			landings.append(cell))
 	game.tick_filter()
@@ -835,3 +856,262 @@ func _test_every_sound_effect_exists() -> void:
 func _test_menu_keys_are_bound() -> void:
 	for action in ["restart", "pause", "confirm", "mute", "to_title"]:
 		_expect(InputMap.has_action(action) and not InputMap.action_get_events(action).is_empty(), "%s is bound to a key" % action)
+
+
+# --- competitive match -------------------------------------------------------
+
+
+# Puts both players on the same board, standing next to each other, so the throw
+# tests do not have to walk anyone through a portal first.
+func _armed_duel(facing := Vector2i.RIGHT) -> MatchState:
+	var match_state := MatchStateClass.new(7777)
+	match_state.start_game()
+	var raider: PlayerSlot = match_state.players[1]
+	match_state.worlds[1].players.erase(raider)
+	match_state.worlds[0].players.append(raider)
+	match_state.world_of_player[1] = 0
+	var home: PlayerSlot = match_state.players[0]
+	home.cell = Vector2i(4, match_state.worlds[0].corridor_y)
+	home.facing = facing
+	raider.cell = home.cell + facing
+	match_state.worlds[0].set_cell(home.cell, GameStateClass.Cell.TUNNEL)
+	match_state.worlds[0].set_cell(raider.cell, GameStateClass.Cell.TUNNEL)
+	home.coffee_charge = MatchStateClass.COFFEE_CHARGE_TIME
+	return match_state
+
+
+func _test_both_worlds_share_a_layout() -> void:
+	var match_state := MatchStateClass.new(1234)
+	_expect(match_state.worlds[0].cells == match_state.worlds[1].cells, "a match grows both plantations from one seed")
+	_expect(match_state.worlds[0].beans == match_state.worlds[1].beans, "both boards hide the beans in the same places")
+	var other := MatchStateClass.new(4321)
+	_expect(other.worlds[0].cells != match_state.worlds[0].cells, "a different match seed lays out a different plantation")
+
+
+func _test_portal_moves_a_player_and_tops_up_the_charge() -> void:
+	var match_state := MatchStateClass.new(2024)
+	match_state.start_game()
+	var slot: PlayerSlot = match_state.players[0]
+	var portal: Vector2i = match_state.worlds[0].portal_cell()
+	slot.cell = portal - Vector2i.RIGHT
+	match_state.worlds[0].set_cell(slot.cell, GameStateClass.Cell.TUNNEL)
+	slot.coffee_charge = 0.0
+	_expect(match_state.move_player(0, Vector2i.RIGHT), "the player can step onto the portal")
+	_expect(match_state.world_of_player[0] == 1, "the portal drops the player on the other plantation")
+	_expect(match_state.worlds[1].players.has(slot), "the visiting slot joins the destination board")
+	_expect(not match_state.worlds[0].players.has(slot), "and leaves the board it came from")
+	_expect(is_equal_approx(slot.coffee_charge, MatchStateClass.PORTAL_CHARGE_BONUS), "a portal hop banks exactly two seconds of charge")
+
+
+func _test_charge_fills_in_three_seconds_and_survives_a_step() -> void:
+	var match_state := MatchStateClass.new(11)
+	match_state.start_game()
+	_expect(not match_state.is_armed(0), "a fresh player has no coffee ready")
+	match_state.advance_time(MatchStateClass.COFFEE_CHARGE_TIME * 0.5)
+	_expect(match_state.move_player(0, Vector2i.RIGHT), "the half-brewed player takes a step")
+	_expect(is_equal_approx(match_state.charge_ratio(0), 0.0), "a step spills a half-brewed coffee")
+	match_state.advance_time(MatchStateClass.COFFEE_CHARGE_TIME)
+	_expect(match_state.is_armed(0), "three seconds of standing still brews a throw")
+	_expect(is_equal_approx(match_state.charge_ratio(0), 1.0), "a full charge reads as a full ring")
+	_expect(match_state.move_player(0, Vector2i.RIGHT), "the armed player takes a step")
+	_expect(match_state.is_armed(0), "a full mug survives the step and waits to be thrown")
+	_expect(match_state.throw_coffee(0), "and only the throw spends it")
+	_expect(not match_state.is_armed(0), "after which the mug is empty again")
+
+
+func _test_throw_needs_a_full_charge() -> void:
+	var match_state := _armed_duel()
+	match_state.players[0].coffee_charge = MatchStateClass.COFFEE_CHARGE_TIME - 0.01
+	var score_before: int = match_state.players[1].score
+	_expect(not match_state.throw_coffee(0), "a half-brewed coffee cannot be thrown")
+	_expect(match_state.players[1].score == score_before, "and costs the rival nothing")
+
+
+func _test_throw_only_reaches_two_cells_along_the_facing() -> void:
+	var match_state := _armed_duel()
+	var victim: PlayerSlot = match_state.players[1]
+	victim.score = 1000
+	victim.cell = match_state.players[0].cell + Vector2i.RIGHT * 3
+	for step in range(1, 4):
+		match_state.worlds[0].set_cell(match_state.players[0].cell + Vector2i.RIGHT * step, GameStateClass.Cell.TUNNEL)
+	_expect(match_state.throw_coffee(0), "the throw itself always happens")
+	_expect(victim.score == 1000, "a rival three cells away is out of range")
+
+
+func _test_throw_is_blocked_by_soil() -> void:
+	var match_state := _armed_duel()
+	var victim: PlayerSlot = match_state.players[1]
+	victim.score = 1000
+	victim.cell = match_state.players[0].cell + Vector2i.RIGHT * 2
+	match_state.worlds[0].set_cell(match_state.players[0].cell + Vector2i.RIGHT, GameStateClass.Cell.SOIL)
+	match_state.worlds[0].set_cell(victim.cell, GameStateClass.Cell.TUNNEL)
+	match_state.throw_coffee(0)
+	_expect(victim.score == 1000, "undug soil stops the mug before it reaches the rival")
+
+
+func _test_a_hit_steals_half_the_score_and_a_life() -> void:
+	var match_state := _armed_duel()
+	var victim: PlayerSlot = match_state.players[1]
+	victim.score = 800
+	victim.earned_score = 800
+	var lives_before: int = victim.lives
+	_expect(match_state.throw_coffee(0), "an armed player can throw")
+	_expect(victim.score == 400, "a hit takes half the rival's match score")
+	_expect(match_state.players[0].score == 400, "and hands it to the thrower")
+	_expect(victim.lives == lives_before - 1, "a hit also costs the rival a life")
+
+
+func _test_stolen_points_never_buy_an_extra_life() -> void:
+	var match_state := _armed_duel()
+	var thief: PlayerSlot = match_state.players[0]
+	var victim: PlayerSlot = match_state.players[1]
+	victim.score = GameStateClass.EXTRA_LIFE_SCORE * 4
+	victim.earned_score = victim.score
+	var thief_lives: int = thief.lives
+	match_state.throw_coffee(0)
+	_expect(thief.score > thief.next_extra_life_score, "the haul carries the thief past the extra-life mark")
+	_expect(thief.lives == thief_lives, "but stolen points hand out no extra life")
+	_expect(thief.earned_score == 0, "because they never touch the earned tally")
+
+
+func _test_a_robbed_player_keeps_their_extra_life_progress() -> void:
+	var match_state := _armed_duel()
+	var victim: PlayerSlot = match_state.players[1]
+	victim.score = 900
+	victim.earned_score = 900
+	match_state.throw_coffee(0)
+	_expect(victim.score == 450, "the victim loses match standing")
+	_expect(victim.earned_score == 900, "but keeps every bean they earned toward the next life")
+
+
+func _test_throw_does_nothing_to_an_invulnerable_rival() -> void:
+	var match_state := _armed_duel()
+	var victim: PlayerSlot = match_state.players[1]
+	victim.score = 1000
+	var lives_before: int = victim.lives
+	victim.invulnerable_until = match_state.worlds[0].world_time + 5.0
+	match_state.throw_coffee(0)
+	_expect(victim.score == 1000, "a freshly respawned rival cannot be robbed")
+	_expect(victim.lives == lives_before, "nor knocked down again")
+
+
+func _test_enemies_hunt_the_nearest_player() -> void:
+	var game := _started_game()
+	game.beans = {Vector2i(15, 9): 0}
+	var corridor: int = game.corridor_y
+	var visitor := game.new_player_slot()
+	game.players.append(visitor)
+	game.players[0].cell = Vector2i(2, corridor)
+	visitor.cell = Vector2i(10, corridor)
+	game.enemies = [Vector2i(9, corridor)]
+	game.enemy_alive = [true]
+	game.enemy_directions = [Vector2i.UP]
+	game.enemy_spawn_ticks = [0]
+	for x in range(1, GameStateClass.WIDTH - 1):
+		game.set_cell(Vector2i(x, corridor), GameStateClass.Cell.TUNNEL)
+	_expect(game._choose_enemy_direction(0, true) == Vector2i.RIGHT, "a guard chases the visitor standing next to it, not the distant resident")
+
+
+func _test_deadlock_check_pauses_when_the_owner_is_away() -> void:
+	var game := _started_game()
+	game.beans = {Vector2i(15, 9): 0}
+	game.players.clear()
+	_expect(game.all_beans_reachable(), "an empty board is never judged unreachable")
+	game.tick_filter()
+	_expect(game.deadlock_since < 0.0, "and never starts a rescue countdown")
+
+
+func _test_match_ends_when_a_player_runs_out_of_lives() -> void:
+	var match_state := MatchStateClass.new(31337)
+	match_state.start_game()
+	var loser: PlayerSlot = match_state.players[1]
+	match_state.players[0].score = 500
+	loser.lives = 1
+	loser.score = 100
+	match_state.worlds[1].lose_life(0)
+	_expect(match_state.is_over, "the match ends the moment a player is filtered out for good")
+	_expect(match_state.winner_index == 0, "the survivor takes the match")
+
+
+func _test_snapshot_roundtrip_restores_the_match() -> void:
+	var host := MatchStateClass.new(555)
+	host.start_game()
+	host.players[0].score = 1234
+	host.players[1].lives = 2
+	host.advance_time(1.25)
+	host.move_player(0, Vector2i.RIGHT)
+	var client := MatchStateClass.new(0)
+	client.apply_bytes(host.to_bytes())
+	_expect(client.worlds[0].cells == host.worlds[0].cells, "the board survives the wire")
+	_expect(client.worlds[0].beans == host.worlds[0].beans, "so do the beans")
+	_expect(client.worlds[0].falling_filters == host.worlds[0].falling_filters, "and the filters")
+	_expect(client.players[0].cell == host.players[0].cell, "the player stands where the host says")
+	_expect(client.players[0].score == 1234, "match standings arrive intact")
+	_expect(client.players[1].lives == 2, "so do lives")
+	_expect(client.match_seed == host.match_seed, "the client learns the match seed")
+
+
+func _test_snapshot_roundtrip_survives_a_player_mid_raid() -> void:
+	var host := MatchStateClass.new(2468)
+	host.start_game()
+	var raider: PlayerSlot = host.players[1]
+	var portal: Vector2i = host.worlds[1].portal_cell()
+	raider.cell = portal - Vector2i.RIGHT
+	host.worlds[1].set_cell(raider.cell, GameStateClass.Cell.TUNNEL)
+	_expect(host.move_player(1, Vector2i.RIGHT), "the raider steps into the portal")
+	_expect(host.world_of_player[1] == 0, "and lands on the rival plantation")
+	raider.score = 4321
+	var client := MatchStateClass.new(0)
+	client.apply_bytes(host.to_bytes())
+	_expect(client.world_of_player[1] == 0, "the client knows the raider changed worlds")
+	_expect(client.worlds[0].players.size() == 2, "both players share the raided board")
+	_expect(client.players[1].score == 4321, "the raider keeps their score across the wire")
+	_expect(client.players[1].cell == host.players[1].cell, "and their position")
+	_expect(client.players[0].cell == host.players[0].cell, "the resident is not confused with the visitor")
+
+
+func _test_a_finished_snapshot_ends_the_match_on_the_client() -> void:
+	var host := MatchStateClass.new(31415)
+	host.start_game()
+	var client := MatchStateClass.new(0)
+	var calls := [0]
+	var winner := [-2]
+	client.finished.connect(func(who: int) -> void:
+		calls[0] += 1
+		winner[0] = who)
+	client.apply_bytes(host.to_bytes())
+	_expect(calls[0] == 0, "a running match does not end on the client")
+	host.players[0].lives = 1
+	host.worlds[0].lose_life(0)
+	_expect(host.is_over, "the host settles the match when someone runs out of lives")
+	client.apply_bytes(host.to_bytes())
+	_expect(calls[0] == 1, "the snapshot that says it is over ends it on the client too")
+	_expect(winner[0] == 1, "and names the same winner the host picked")
+	client.apply_bytes(host.to_bytes())
+	_expect(calls[0] == 1, "further snapshots do not end it a second time")
+
+
+func _test_net_link_offers_a_rematch_handshake() -> void:
+	var link := NetLinkClass.new()
+	_expect(link.has_signal("rematch_requested"), "the link carries a rematch request")
+	_expect(link.has_method("send_rematch"), "which either side can send")
+	link.send_rematch()
+	_expect(not link.is_online(), "and an offline link quietly ignores it")
+	link.free()
+
+
+func _test_net_link_compiles_and_starts_offline() -> void:
+	var link := NetLinkClass.new()
+	_expect(link != null, "net_link.gd compiles")
+	_expect(not link.is_online(), "a fresh link is offline")
+	_expect(link.local_player_index() == 1, "an unconnected link speaks for the guest slot")
+	_expect(NetLinkClass.GAME_PORT != NetLinkClass.DISCOVERY_PORT, "discovery and play use separate ports")
+	link.free()
+
+
+func _test_throw_key_is_bound() -> void:
+	_expect(InputMap.has_action("throw"), "the coffee throw has an input action")
+	var bound := false
+	for event in InputMap.action_get_events("throw"):
+		bound = bound or event is InputEventKey
+	_expect(bound, "the coffee throw is reachable from the keyboard")

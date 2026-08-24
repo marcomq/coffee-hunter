@@ -30,3 +30,4 @@ pause={"deadzone": 0.2, "events": [Object(InputEventKey,"physical_keycode":80)]}
 confirm={"deadzone": 0.2, "events": [Object(InputEventKey,"keycode":32), Object(InputEventKey,"keycode":4194309)]}
 mute={"deadzone": 0.2, "events": [Object(InputEventKey,"physical_keycode":77)]}
 to_title={"deadzone": 0.2, "events": [Object(InputEventKey,"keycode":4194305)]}
+throw={"deadzone": 0.2, "events": [Object(InputEventKey,"physical_keycode":70), Object(InputEventKey,"keycode":4194326)]}

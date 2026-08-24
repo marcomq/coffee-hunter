@@ -2,9 +2,10 @@ class_name GameState
 extends RefCounted
 
 const LevelDataClass = preload("res://scripts/level_data.gd")
+const PlayerSlotClass = preload("res://scripts/player_slot.gd")
 
 signal changed
-signal event_emitted(kind: StringName, cell: Vector2i)
+signal event_emitted(kind: StringName, cell: Vector2i, player_index: int)
 
 enum Cell { SOIL, TUNNEL }
 enum Phase { READY, PLAYING, WON, GAME_OVER }
@@ -29,6 +30,7 @@ const CONTACT_TOUCH_FRACTION := 0.35
 # remains escapable even though its sprite now moves continuously between ticks.
 const ENEMY_CONTACT_MOVE_FRACTION := 0.82
 const RESPAWN_INVULNERABILITY := 3.0
+const START_LIVES := 3
 const ENEMY_SQUASH_SCORE := 200
 const EXTRA_LIFE_SCORE := 2000
 # A bean walled in by unpushable filters must persist this long before the level
@@ -51,8 +53,9 @@ const ENEMY_START_OFFSETS := [
 
 var cells: Array[int] = []
 var beans: Dictionary = {}
-var player := START_PLAYER
-var player_facing := Vector2i.DOWN
+# Everyone standing on this board. Usually the world's own player; two while a
+# rival is visiting through the portal.
+var players: Array[PlayerSlot] = []
 var enemies: Array[Vector2i] = []
 var enemy_alive: Array[bool] = []
 var enemy_directions: Array[Vector2i] = []
@@ -62,21 +65,16 @@ var enemy_tick := 0
 var falling_filters: Array[Vector2i] = []
 var falling_filter_states: Array[bool] = []
 var filter_pushed_at: Array[float] = []
+# Who last shoved each filter, so a squash pays the player who set it up rather
+# than always the world's own resident.
+var filter_pushed_by: Array[int] = []
 var level_filter_starts: Array[Vector2i] = []
-var score := 0
-var lives := 3
 var phase := Phase.READY
 var level_index := 0
 var enemy_random := RandomNumberGenerator.new()
 var layout_random := RandomNumberGenerator.new()
 var world_time := 0.0
 var tunnel_opened_at: Dictionary = {}
-var enemy_contact_since := -1.0
-var invulnerable_until := 0.0
-var next_extra_life_score := EXTRA_LIFE_SCORE
-var player_prev := START_PLAYER
-var player_moved_at := -1.0
-var player_arrives_at := 0.0
 var enemy_prev: Array[Vector2i] = []
 var enemy_arrives_at: Array[float] = []
 var deadlock_since := -1.0
@@ -88,17 +86,71 @@ var player_start := START_PLAYER
 var enemy_respawn_at: Array[float] = []
 var filter_kill_streak: Array[int] = []
 var last_squash_score := ENEMY_SQUASH_SCORE
+# Below zero keeps the historical behaviour: every world rolls its own layout.
+# A match hands both boards the same seed so the race is run on equal ground.
+var match_seed := -1
+
+# Single-player views of the first slot. The whole game was written around one
+# player, so these keep every existing call site and test working unchanged
+# while the rules underneath moved to `players`.
+var player: Vector2i:
+	get: return players[0].cell
+	set(value): players[0].cell = value
+var player_facing: Vector2i:
+	get: return players[0].facing
+	set(value): players[0].facing = value
+var player_prev: Vector2i:
+	get: return players[0].prev
+	set(value): players[0].prev = value
+var player_moved_at: float:
+	get: return players[0].moved_at
+	set(value): players[0].moved_at = value
+var player_arrives_at: float:
+	get: return players[0].arrives_at
+	set(value): players[0].arrives_at = value
+var invulnerable_until: float:
+	get: return players[0].invulnerable_until
+	set(value): players[0].invulnerable_until = value
+var enemy_contact_since: float:
+	get: return players[0].contact_since
+	set(value): players[0].contact_since = value
+var lives: int:
+	get: return players[0].lives
+	set(value): players[0].lives = value
+var next_extra_life_score: int:
+	get: return players[0].next_extra_life_score
+	set(value): players[0].next_extra_life_score = value
+# Assigning a score outside a match is always a test or setup fixture, never a
+# theft, so the earned tally follows along and the extra-life ladder stays sane.
+var score: int:
+	get: return players[0].score
+	set(value):
+		players[0].score = value
+		players[0].earned_score = value
 
 
-func _init() -> void:
+func _init(layout_seed := -1) -> void:
+	match_seed = layout_seed
+	players = [new_player_slot()]
 	new_game()
+
+
+func new_player_slot() -> PlayerSlot:
+	var slot := PlayerSlotClass.new()
+	slot.cell = player_start
+	slot.prev = player_start
+	slot.next_extra_life_score = EXTRA_LIFE_SCORE
+	slot.lives = START_LIVES
+	return slot
 
 
 func new_game() -> void:
 	level_index = 0
-	score = 0
-	lives = 3
-	next_extra_life_score = EXTRA_LIFE_SCORE
+	for slot in players:
+		slot.score = 0
+		slot.earned_score = 0
+		slot.lives = START_LIVES
+		slot.next_extra_life_score = EXTRA_LIFE_SCORE
 	_load_level()
 
 
@@ -116,21 +168,38 @@ func _load_level() -> void:
 	cells.fill(Cell.SOIL)
 	beans.clear()
 	world_time = 0.0
-	invulnerable_until = 0.0
+	for slot in players:
+		slot.invulnerable_until = 0.0
 	deadlock_since = -1.0
 	tunnel_opened_at.clear()
 	phase = Phase.READY
+	_seed_layout_random()
 	_carve_initial_tunnels()
 	_randomize_level_objects()
 	_reset_actors(true)
 	changed.emit()
 
 
+# Seeded only here, never inside the layout builders: reshuffle_level() rebuilds
+# a board by calling them again, and reseeding there would hand back the very
+# same walled-in level the rescue was trying to escape.
+func _seed_layout_random() -> void:
+	if match_seed < 0:
+		layout_random.randomize()
+	else:
+		layout_random.seed = hash(Vector2i(match_seed, level_index))
+
+
+# The portal sits on the branch corner: always carved, well away from both the
+# player start and the nest.
+func portal_cell() -> Vector2i:
+	return Vector2i(branch_x, branch_y)
+
+
 # The original jittered the cross per level (LevelN's middleX/middleY); a fixed
 # one made every board read the same. Anything that must sit on a corridor - the
 # player start, the nest - is derived from these four numbers, never hardcoded.
 func _carve_initial_tunnels() -> void:
-	layout_random.randomize()
 	corridor_y = layout_random.randi_range(4, 6)
 	shaft_x = layout_random.randi_range(6, 10)
 	branch_x = layout_random.randi_range(shaft_x + 3, WIDTH - 3)
@@ -148,12 +217,8 @@ func _carve_initial_tunnels() -> void:
 
 
 func _reset_actors(revive_enemies: bool) -> void:
-	player = player_start
-	player_facing = Vector2i.DOWN
-	player_prev = player_start
-	player_moved_at = -1.0
-	player_arrives_at = 0.0
-	enemy_contact_since = -1.0
+	for slot in players:
+		_reset_player_slot(slot)
 	var survivors := enemy_alive.duplicate()
 	enemies.clear()
 	enemy_directions.clear()
@@ -183,7 +248,19 @@ func _reset_actors(revive_enemies: bool) -> void:
 	falling_filter_states.resize(level_filter_starts.size())
 	falling_filter_states.fill(false)
 	filter_pushed_at.clear()
+	filter_pushed_by.clear()
 	_sync_parallel_arrays()
+
+
+# Invulnerability is deliberately not touched here: `lose_life` grants it right
+# after calling this, and a level load clears it separately.
+func _reset_player_slot(slot: PlayerSlot) -> void:
+	slot.cell = player_start
+	slot.facing = Vector2i.DOWN
+	slot.prev = player_start
+	slot.moved_at = -1.0
+	slot.arrives_at = 0.0
+	slot.contact_since = -1.0
 
 
 func _enemy_spawn_tick(enemy_index: int) -> int:
@@ -211,7 +288,6 @@ func _randomize_level_objects() -> void:
 
 
 func _place_objects(bean_tiers: Array[int]) -> void:
-	layout_random.randomize()
 	var soil_cells: Array[Vector2i] = []
 	for y in range(1, HEIGHT - 1):
 		for x in range(1, WIDTH - 1):
@@ -267,6 +343,9 @@ func _sync_parallel_arrays() -> void:
 	while filter_pushed_at.size() < falling_filters.size():
 		filter_pushed_at.append(-1.0)
 	filter_pushed_at.resize(falling_filters.size())
+	while filter_pushed_by.size() < falling_filters.size():
+		filter_pushed_by.append(0)
+	filter_pushed_by.resize(falling_filters.size())
 
 
 func start_game() -> void:
@@ -275,12 +354,12 @@ func start_game() -> void:
 		changed.emit()
 
 
-func is_invulnerable() -> bool:
-	return phase == Phase.PLAYING and world_time < invulnerable_until
+func is_invulnerable(player_index := 0) -> bool:
+	return phase == Phase.PLAYING and world_time < players[player_index].invulnerable_until
 
 
-func invulnerability_left() -> float:
-	return maxf(invulnerable_until - world_time, 0.0)
+func invulnerability_left(player_index := 0) -> float:
+	return maxf(players[player_index].invulnerable_until - world_time, 0.0)
 
 
 func advance_time(delta: float) -> void:
@@ -336,11 +415,12 @@ func set_cell(cell: Vector2i, value: int) -> void:
 		cells[index(cell)] = value
 
 
-func move_player(direction: Vector2i) -> bool:
+func move_player(direction: Vector2i, player_index := 0) -> bool:
 	if phase != Phase.PLAYING or direction == Vector2i.ZERO:
 		return false
 	_sync_parallel_arrays()
-	var target := player + direction
+	var slot := players[player_index]
+	var target := slot.cell + direction
 	if not is_inside(target):
 		return false
 
@@ -361,17 +441,18 @@ func move_player(direction: Vector2i) -> bool:
 		var below_pushed_filter := pushed_to + Vector2i.DOWN
 		falling_filter_states[filter_index] = is_inside(below_pushed_filter) and get_cell(below_pushed_filter) == Cell.TUNNEL
 		filter_pushed_at[filter_index] = world_time
+		filter_pushed_by[filter_index] = player_index
 
-	player_prev = player
-	player_moved_at = world_time
-	player_arrives_at = world_time + player_touch_delay()
-	player = target
-	player_facing = direction
-	if get_cell(player) == Cell.SOIL:
-		set_cell(player, Cell.TUNNEL)
-		tunnel_opened_at[player] = world_time
-		event_emitted.emit(&"dug", player)
-	_collect_at_player()
+	slot.prev = slot.cell
+	slot.moved_at = world_time
+	slot.arrives_at = world_time + player_touch_delay()
+	slot.cell = target
+	slot.facing = direction
+	if get_cell(slot.cell) == Cell.SOIL:
+		set_cell(slot.cell, Cell.TUNNEL)
+		tunnel_opened_at[slot.cell] = world_time
+		event_emitted.emit(&"dug", slot.cell, player_index)
+	_collect_at_player(player_index)
 	_resolve_contacts()
 	changed.emit()
 	return true
@@ -398,10 +479,17 @@ func tick_contacts() -> void:
 	if phase != Phase.PLAYING:
 		return
 	_sync_parallel_arrays()
-	var lives_before := lives
+	var lives_before := _total_lives()
 	_resolve_contacts()
-	if lives != lives_before:
+	if _total_lives() != lives_before:
 		changed.emit()
+
+
+func _total_lives() -> int:
+	var total := 0
+	for slot in players:
+		total += slot.lives
+	return total
 
 
 func tick_enemy(kind: StringName = &"all") -> bool:
@@ -429,7 +517,7 @@ func _revive_enemies() -> bool:
 		if world_time < enemy_respawn_at[enemy_index]:
 			continue
 		var nest := _enemy_start(enemy_index)
-		if nest == player or falling_filters.has(nest) or _active_enemy_at(nest) >= 0:
+		if player_at(nest) >= 0 or falling_filters.has(nest) or _active_enemy_at(nest) >= 0:
 			continue
 		enemy_alive[enemy_index] = true
 		enemy_respawn_at[enemy_index] = -1.0
@@ -438,21 +526,44 @@ func _revive_enemies() -> bool:
 		enemy_arrives_at[enemy_index] = world_time
 		enemy_directions[enemy_index] = [Vector2i.LEFT, Vector2i.RIGHT, Vector2i.UP, Vector2i.DOWN][enemy_index % 4]
 		enemy_turns_since_dig[enemy_index] = 0
-		event_emitted.emit(&"enemy_respawned", nest)
+		event_emitted.emit(&"enemy_respawned", nest, -1)
 		revived = true
 	return revived
 
 
-func _collect_at_player() -> void:
-	if not beans.has(player):
+# -1 when nobody stands there. Board-wide events carry -1 as their player index.
+func player_at(cell: Vector2i) -> int:
+	for player_index in range(players.size()):
+		if players[player_index].cell == cell:
+			return player_index
+	return -1
+
+
+# Enemies hunt whoever is closest, so a raider walking into the neighbouring
+# plantation draws its guards away from the player who lives there.
+func _nearest_player(from: Vector2i) -> int:
+	var best := -1
+	var best_distance := 1 << 30
+	for player_index in range(players.size()):
+		var delta: Vector2i = players[player_index].cell - from
+		var distance := absi(delta.x) + absi(delta.y)
+		if distance < best_distance:
+			best_distance = distance
+			best = player_index
+	return best
+
+
+func _collect_at_player(player_index: int) -> void:
+	var cell := players[player_index].cell
+	if not beans.has(cell):
 		return
-	var tier: int = beans[player]
-	beans.erase(player)
-	_add_score(LevelDataClass.bean_value(tier))
-	event_emitted.emit(&"coffee", player)
+	var tier: int = beans[cell]
+	beans.erase(cell)
+	_add_score(player_index, LevelDataClass.bean_value(tier))
+	event_emitted.emit(&"coffee", cell, player_index)
 	if beans.is_empty():
 		phase = Phase.WON
-		event_emitted.emit(&"won", player)
+		event_emitted.emit(&"won", cell, player_index)
 
 
 func _advance_filter() -> bool:
@@ -475,7 +586,7 @@ func _advance_filter() -> bool:
 		falling_filter_states[filter_index] = can_fall
 		if not can_fall:
 			if was_falling:
-				event_emitted.emit(&"filter_landed", falling_filters[filter_index])
+				event_emitted.emit(&"filter_landed", falling_filters[filter_index], -1)
 			filter_kill_streak[filter_index] = 0
 			continue
 		falling_filters[filter_index] = below
@@ -486,8 +597,8 @@ func _advance_filter() -> bool:
 			enemy_respawn_at[enemy_index] = world_time + ENEMY_RESPAWN_DELAY
 			last_squash_score = ENEMY_SQUASH_SCORE * int(pow(MULTI_SQUASH_MULTIPLIER, filter_kill_streak[filter_index]))
 			filter_kill_streak[filter_index] += 1
-			_add_score(last_squash_score)
-			event_emitted.emit(&"enemy_squashed", below)
+			_add_score(filter_pushed_by[filter_index], last_squash_score)
+			event_emitted.emit(&"enemy_squashed", below, filter_pushed_by[filter_index])
 	return moved
 
 
@@ -514,7 +625,7 @@ func _advance_enemy(kind: StringName = &"all") -> bool:
 			set_cell(destination, Cell.TUNNEL)
 			tunnel_opened_at[destination] = world_time
 			enemy_turns_since_dig[enemy_index] = 0
-			event_emitted.emit(&"dug", destination)
+			event_emitted.emit(&"dug", destination, -1)
 		enemies[enemy_index] = destination
 		enemy_arrives_at[enemy_index] = world_time + enemy_touch_delay(enemy_index)
 		moved = true
@@ -527,20 +638,25 @@ func is_enemy_active(enemy_index: int) -> bool:
 
 func _choose_enemy_direction(enemy_index: int, should_chase: bool) -> Vector2i:
 	var forward := enemy_directions[enemy_index]
-	if is_ultra(enemy_index):
-		var delta := player - enemies[enemy_index]
-		var direct_directions := _directions_toward(delta)
-		for direction in direct_directions:
-			if _enemy_can_dig(enemy_index, direction):
-				return direction
-		var path_direction := _shortest_tunnel_direction(enemy_index)
-		if path_direction != Vector2i.ZERO:
-			return path_direction
-	if should_chase:
-		var delta := player - enemies[enemy_index]
-		var chase_direction := Vector2i(signi(delta.x), 0) if absi(delta.x) > absi(delta.y) else Vector2i(0, signi(delta.y))
-		if _enemy_can_move(enemy_index, chase_direction):
-			return chase_direction
+	# An empty board (its resident is away raiding) leaves nothing to hunt, so the
+	# guards fall through to their patrol.
+	var target_index := _nearest_player(enemies[enemy_index])
+	if target_index >= 0:
+		var target_cell: Vector2i = players[target_index].cell
+		if is_ultra(enemy_index):
+			var delta := target_cell - enemies[enemy_index]
+			var direct_directions := _directions_toward(delta)
+			for direction in direct_directions:
+				if _enemy_can_dig(enemy_index, direction):
+					return direction
+			var path_direction := _shortest_tunnel_direction(enemy_index, target_cell)
+			if path_direction != Vector2i.ZERO:
+				return path_direction
+		if should_chase:
+			var delta := target_cell - enemies[enemy_index]
+			var chase_direction := Vector2i(signi(delta.x), 0) if absi(delta.x) > absi(delta.y) else Vector2i(0, signi(delta.y))
+			if _enemy_can_move(enemy_index, chase_direction):
+				return chase_direction
 	if _enemy_can_move(enemy_index, forward):
 		return forward
 	if enemy_kind(enemy_index) == &"teapot" and _enemy_can_dig(enemy_index, forward):
@@ -591,7 +707,7 @@ func _directions_toward(delta: Vector2i) -> Array[Vector2i]:
 	return directions
 
 
-func _shortest_tunnel_direction(enemy_index: int) -> Vector2i:
+func _shortest_tunnel_direction(enemy_index: int, target_cell: Vector2i) -> Vector2i:
 	var start := enemies[enemy_index]
 	var queue: Array[Vector2i] = [start]
 	var first_step := {start: Vector2i.ZERO}
@@ -599,7 +715,7 @@ func _shortest_tunnel_direction(enemy_index: int) -> Vector2i:
 	while queue_index < queue.size():
 		var current := queue[queue_index]
 		queue_index += 1
-		var directions := _directions_toward(player - current)
+		var directions := _directions_toward(target_cell - current)
 		for cardinal in [Vector2i.LEFT, Vector2i.RIGHT, Vector2i.UP, Vector2i.DOWN]:
 			if not directions.has(cardinal):
 				directions.append(cardinal)
@@ -607,10 +723,10 @@ func _shortest_tunnel_direction(enemy_index: int) -> Vector2i:
 			var candidate: Vector2i = current + direction
 			if first_step.has(candidate) or not is_inside(candidate) or get_cell(candidate) != Cell.TUNNEL or falling_filters.has(candidate):
 				continue
-			if candidate != player and _active_enemy_at(candidate) >= 0:
+			if candidate != target_cell and _active_enemy_at(candidate) >= 0:
 				continue
 			var initial_direction: Vector2i = direction if current == start else first_step[current]
-			if candidate == player:
+			if candidate == target_cell:
 				return initial_direction
 			first_step[candidate] = initial_direction
 			queue.append(candidate)
@@ -624,47 +740,60 @@ func _active_enemy_at(cell: Vector2i) -> int:
 	return -1
 
 
-func _add_score(points: int) -> void:
-	score += points
-	while score >= next_extra_life_score:
-		lives += 1
-		next_extra_life_score *= 2
-		event_emitted.emit(&"life_gained", player)
+# The ladder reads `earned_score`, never `score`, so points taken off a rival
+# raise the match standing without also handing out lives.
+func _add_score(player_index: int, points: int) -> void:
+	var slot := players[player_index]
+	slot.score += points
+	slot.earned_score += points
+	while slot.earned_score >= slot.next_extra_life_score:
+		slot.lives += 1
+		slot.next_extra_life_score *= 2
+		event_emitted.emit(&"life_gained", slot.cell, player_index)
 
 
 # Sharing a cell only kills once both sprites have really met there. Walking into
 # a tea-pod is therefore always fatal - the player cannot leave before his own
 # arrival - while a pod that steps onto him leaves a window to slip away.
 func _resolve_contacts() -> void:
-	if phase != Phase.PLAYING or world_time < invulnerable_until:
+	if phase != Phase.PLAYING:
+		return
+	for player_index in range(players.size()):
+		_resolve_contacts_for(player_index)
+
+
+func _resolve_contacts_for(player_index: int) -> void:
+	var slot := players[player_index]
+	if world_time < slot.invulnerable_until:
 		return
 	# A dropped filter is a telegraphed hazard and stays instantly lethal.
-	if falling_filters.has(player):
-		lose_life()
+	if falling_filters.has(slot.cell):
+		lose_life(player_index)
 		return
 	# Swapping cells with a tea-pod is a head-on pass-through, not a graze: the
 	# two sprites cross in mid-corridor, so there is nothing left to wait for.
-	if _crossing_enemy() >= 0:
-		lose_life()
+	if _crossing_enemy(player_index) >= 0:
+		lose_life(player_index)
 		return
-	var enemy_index := _active_enemy_at(player)
+	var enemy_index := _active_enemy_at(slot.cell)
 	if enemy_index < 0:
-		enemy_contact_since = -1.0
+		slot.contact_since = -1.0
 		return
-	if enemy_contact_since < 0.0:
-		enemy_contact_since = world_time
-		event_emitted.emit(&"close_call", player)
-	if world_time >= maxf(player_arrives_at, enemy_arrives_at[enemy_index]):
-		lose_life()
+	if slot.contact_since < 0.0:
+		slot.contact_since = world_time
+		event_emitted.emit(&"close_call", slot.cell, player_index)
+	if world_time >= maxf(slot.arrives_at, enemy_arrives_at[enemy_index]):
+		lose_life(player_index)
 
 
-func _crossing_enemy() -> int:
-	if player_moved_at < 0.0 or world_time - player_moved_at > player_step_time():
+func _crossing_enemy(player_index := 0) -> int:
+	var slot := players[player_index]
+	if slot.moved_at < 0.0 or world_time - slot.moved_at > player_step_time():
 		return -1
 	for enemy_index in range(enemies.size()):
 		if not is_enemy_active(enemy_index):
 			continue
-		if enemies[enemy_index] == player_prev and enemy_prev[enemy_index] == player:
+		if enemies[enemy_index] == slot.prev and enemy_prev[enemy_index] == slot.cell:
 			return enemy_index
 	return -1
 
@@ -677,7 +806,7 @@ func _check_deadlock() -> void:
 		deadlock_since = world_time
 		return
 	if world_time - deadlock_since >= DEADLOCK_CONFIRM_TIME:
-		event_emitted.emit(&"level_reshuffled", player)
+		event_emitted.emit(&"level_reshuffled", players[0].cell if not players.is_empty() else nest_cell(), -1)
 		reshuffle_level()
 		changed.emit()
 
@@ -697,9 +826,16 @@ func reshuffle_level() -> void:
 	_reset_actors(false)
 
 
+# Reachability is judged from whoever actually stands on this board; with the
+# owner away through the portal there is no vantage point and nothing to rescue.
 func all_beans_reachable() -> bool:
-	var reached := {player: true}
-	var frontier: Array[Vector2i] = [player]
+	if players.is_empty():
+		return true
+	var reached := {}
+	var frontier: Array[Vector2i] = []
+	for slot in players:
+		reached[slot.cell] = true
+		frontier.append(slot.cell)
 	var found := 0
 	while not frontier.is_empty():
 		var cell: Vector2i = frontier.pop_back()
@@ -727,14 +863,98 @@ func _can_step_into(target: Vector2i, direction: Vector2i) -> bool:
 	return is_inside(pushed_to) and not beans.has(pushed_to) and not falling_filters.has(pushed_to)
 
 
-func lose_life() -> void:
+func lose_life(player_index := 0) -> void:
 	if phase != Phase.PLAYING:
 		return
-	lives -= 1
-	event_emitted.emit(&"life_lost", player)
-	if lives <= 0:
+	var slot := players[player_index]
+	slot.lives -= 1
+	event_emitted.emit(&"life_lost", slot.cell, player_index)
+	if slot.lives <= 0:
 		phase = Phase.GAME_OVER
-		event_emitted.emit(&"game_over", player)
+		event_emitted.emit(&"game_over", slot.cell, player_index)
 	else:
 		_reset_actors(false)
-		invulnerable_until = world_time + RESPAWN_INVULNERABILITY
+		slot.invulnerable_until = world_time + RESPAWN_INVULNERABILITY
+
+
+# --- network snapshots -------------------------------------------------------
+# The host owns the simulation; a client never simulates, it only draws. So this
+# carries a RENDER model, not a full copy of the state: arrival times, contact
+# timers and the extra-life ladder stay host-side.
+#
+# Everything is positional and bit-packed to keep a whole match inside ENet's
+# 1392-byte MTU. Crossing it would fragment the unreliable snapshot stream and
+# cost far more in dropped packets than the packing saves in effort.
+
+
+func to_snapshot() -> Array:
+	var packed_cells := PackedByteArray()
+	packed_cells.resize((cells.size() + 7) / 8)
+	for index in range(cells.size()):
+		if cells[index] == Cell.TUNNEL:
+			packed_cells[index / 8] |= 1 << (index % 8)
+	var packed_beans := PackedInt32Array()
+	for cell: Vector2i in beans:
+		packed_beans.append(index(cell))
+		packed_beans.append(beans[cell])
+	var packed_enemies := PackedInt32Array()
+	var packed_alive := PackedByteArray()
+	for enemy_index in range(enemies.size()):
+		packed_enemies.append(index(enemies[enemy_index]))
+		packed_alive.append(1 if is_enemy_active(enemy_index) else 0)
+	var packed_filters := PackedInt32Array()
+	var packed_filter_states := PackedByteArray()
+	for filter_index in range(falling_filters.size()):
+		packed_filters.append(index(falling_filters[filter_index]))
+		packed_filter_states.append(1 if falling_filter_states[filter_index] else 0)
+	return [
+		packed_cells, packed_beans, packed_enemies, packed_alive,
+		packed_filters, packed_filter_states,
+		phase, level_index, world_time,
+		corridor_y, shaft_x, branch_x, branch_y, index(player_start),
+	]
+
+
+func apply_snapshot(snapshot: Array) -> void:
+	var packed_cells: PackedByteArray = snapshot[0]
+	cells.resize(WIDTH * HEIGHT)
+	for cell_index in range(cells.size()):
+		var bit: int = packed_cells[cell_index / 8] & (1 << (cell_index % 8))
+		cells[cell_index] = Cell.TUNNEL if bit != 0 else Cell.SOIL
+	beans.clear()
+	var packed_beans: PackedInt32Array = snapshot[1]
+	for pair in range(0, packed_beans.size(), 2):
+		beans[cell_of(packed_beans[pair])] = packed_beans[pair + 1]
+	var packed_enemies: PackedInt32Array = snapshot[2]
+	var packed_alive: PackedByteArray = snapshot[3]
+	enemies.clear()
+	enemy_alive.clear()
+	for enemy_index in range(packed_enemies.size()):
+		enemies.append(cell_of(packed_enemies[enemy_index]))
+		enemy_alive.append(packed_alive[enemy_index] != 0)
+	# A client draws whoever the host says is on the board, so every listed pod is
+	# already past its spawn tick.
+	enemy_spawn_ticks.clear()
+	enemy_spawn_ticks.resize(enemies.size())
+	enemy_spawn_ticks.fill(0)
+	enemy_tick = 1
+	var packed_filters: PackedInt32Array = snapshot[4]
+	var packed_filter_states: PackedByteArray = snapshot[5]
+	falling_filters.clear()
+	falling_filter_states.clear()
+	for filter_index in range(packed_filters.size()):
+		falling_filters.append(cell_of(packed_filters[filter_index]))
+		falling_filter_states.append(packed_filter_states[filter_index] != 0)
+	phase = snapshot[6]
+	level_index = snapshot[7]
+	world_time = snapshot[8]
+	corridor_y = snapshot[9]
+	shaft_x = snapshot[10]
+	branch_x = snapshot[11]
+	branch_y = snapshot[12]
+	player_start = cell_of(snapshot[13])
+	_sync_parallel_arrays()
+
+
+func cell_of(cell_index: int) -> Vector2i:
+	return Vector2i(cell_index % WIDTH, cell_index / WIDTH)
