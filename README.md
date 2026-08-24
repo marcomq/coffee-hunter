@@ -54,41 +54,64 @@ godot --path .
 
 Controls: WASD or arrow keys. Hold and drag the left mouse button to simulate device tilt. Press `R` to restart.
 
-## Two Plantations (network match)
+Type your name into the field at the bottom of the title screen. It is remembered
+between sessions, it labels you in a network race, and it is what stands next to
+your score in the high-score table — the five best single-player runs, shown on
+the title screen. Match scores stay out of that table: they include points stolen
+off a rival and would not compare.
 
-Press `N` on the title screen for a competitive two-player race. Both plantations
-are grown from one shared seed, so the two boards are identical and the race is
-fair. A portal on the branch corner links them - the turning blue ring on the
-board: step onto it to raid your rival's field, where beans you pick count for
-*your* score and a shoved coffee filter is as lethal to a player as it is to a
-tea-pod.
+## Plantations (network match)
+
+Press `N` on the title screen for a race of **two to four** players. Every
+plantation is grown from one shared seed, so all boards are identical and the
+race is fair. Each board carries a portal — the turning blue ring — and the
+portals form a ring of their own: stepping into one drops you on the *next*
+plantation, and a full lap brings you home. Beans you pick while raiding count
+for *your* score, and a shoved coffee filter is as lethal to a player as it is to
+a tea-pod.
 
 Standing still for three seconds brews a coffee; `F` (or `Ctrl`) throws it, which
 the side panel spells out during a match. Walking spills a half-brewed mug, but a
 full one keeps until it is thrown. It flies two cells along your facing, stops at
 undug soil, and a hit takes half the rival's score and one life. A portal hop
-banks two of the three seconds, so raiding arrives nearly armed. Stolen points never buy extra lives - only beans
-you picked yourself count toward those.
+banks two of the three seconds, so raiding arrives nearly armed. Stolen points
+never buy extra lives — only beans you picked yourself count toward those.
 
-The side panel keeps the rival's score, lives and whether they are standing on
-your board in view the whole time.
+The side panel lists every player in their own colour, the same colour their
+figure wears on the board, with score, lives and whether they are standing on the
+board you are looking at.
 
-The match runs over `MATCH_LEVELS` levels, or ends early when someone runs out of
-lives. The end screen offers a rematch that takes *both* sides: each presses
-SPACE, the panel shows who has already agreed, and the host starts the next race
-on a fresh seed once the second one does. ESC leaves for the title and drops the
-link.
+Run out of lives and you are **out**: your figure leaves the board and you watch
+the rest of the race from where you fell. The others carry on, and whoever is
+still standing when everybody else is out wins — survival beats scoring. Only a
+match that runs its full `MATCH_LEVELS` is settled on points. Someone who loses
+their connection is dropped the same way, so a quitter cannot end anyone else's
+race.
+
+The end screen offers a rematch that takes *everybody*: each player presses
+SPACE, the screen names who is still missing, and the host starts the next race on
+a fresh seed once the last one agrees. Seats left empty by quitters are closed up
+first. ESC leaves for the title and drops the link.
 
 ### Connecting
 
-The host is found automatically on the local network - press `H` to host, then
-pick the game from the list with a number key. Typing an address works too: click
-the field first, since a focused field swallows the shortcuts. That is what covers
-`127.0.0.1` for a local test and a Tailscale/ZeroTier address for playing over the
-internet without port forwarding or a relay.
+The host is found automatically on the local network — press `H` to host, then
+pick the game from the list with a number key; the list shows how full each game
+is. Typing an address works too: click the field first, since a focused field
+swallows the shortcuts. That is what covers `127.0.0.1` for a local test and a
+Tailscale/ZeroTier address for playing over the internet without port forwarding
+or a relay.
 
-Two instances on one machine do not see each other in the list - both would need
-the same discovery port - so join the second one by typing `127.0.0.1`.
+Joining puts you in a waiting room that lists everyone present. Nobody drops into
+a race unannounced: the host presses SPACE when the room is as full as it is going
+to get, from two players upward.
+
+Two instances on one machine do not see each other in the list — both would need
+the same discovery port — so join the second one by typing `127.0.0.1`.
+
+The host owns the simulation and ships each guest only the one plantation that
+guest is standing on. Four whole boards would not fit in a single ENet packet, and
+a client never draws the others anyway.
 
 The level runs continuously: enemies and falling filters use independent realtime clocks instead of advancing only when the player moves.
 

@@ -758,8 +758,12 @@ func _add_score(player_index: int, points: int) -> void:
 func _resolve_contacts() -> void:
 	if phase != Phase.PLAYING:
 		return
-	for player_index in range(players.size()):
-		_resolve_contacts_for(player_index)
+	# A fatal contact can take its slot off the board, so walk a copy and look the
+	# index up again: the live list shrinks underneath this loop.
+	for slot in players.duplicate():
+		var player_index := players.find(slot)
+		if player_index >= 0:
+			_resolve_contacts_for(player_index)
 
 
 func _resolve_contacts_for(player_index: int) -> void:
@@ -870,10 +874,19 @@ func lose_life(player_index := 0) -> void:
 	slot.lives -= 1
 	event_emitted.emit(&"life_lost", slot.cell, player_index)
 	if slot.lives <= 0:
-		phase = Phase.GAME_OVER
+		# A board with company keeps running: the match layer takes the dead slot
+		# off it and the others race on. Alone - every single-player run - the
+		# board itself is over, exactly as before.
+		if players.size() <= 1:
+			phase = Phase.GAME_OVER
 		event_emitted.emit(&"game_over", slot.cell, player_index)
 	else:
-		_reset_actors(false)
+		# The full reset also drags every other slot back to the start cell, which
+		# would punish a raider for a death that was not theirs.
+		if players.size() <= 1:
+			_reset_actors(false)
+		else:
+			_reset_player_slot(slot)
 		slot.invulnerable_until = world_time + RESPAWN_INVULNERABILITY
 
 

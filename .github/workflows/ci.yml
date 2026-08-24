@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-godot
+        with:
+          version: "4.7.2"
+
+      # run_tests.gd exits with the number of failures, so a non-zero exit fails the job.
+      - name: Run test suite
+        run: godot --headless --path . --script tests/run_tests.gd

@@ -16,6 +16,9 @@ var score := 0
 # `score` so that points taken off a rival can never buy lives.
 var earned_score := 0
 var lives := 3
+# Out of lives, or gone from the link. An eliminated slot is taken off its board
+# entirely, so the rules below never have to ask.
+var is_out := false
 # Seconds of standing still banked toward the next coffee throw. Travels with the
 # slot, so a portal hop can top it up.
 var coffee_charge := 0.0

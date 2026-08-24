@@ -71,6 +71,15 @@ func _init() -> void:
 	_test_enemies_hunt_the_nearest_player()
 	_test_deadlock_check_pauses_when_the_owner_is_away()
 	_test_match_ends_when_a_player_runs_out_of_lives()
+	_test_the_portal_ring_visits_every_plantation()
+	_test_the_last_player_standing_wins()
+	_test_an_eliminated_player_leaves_the_board_and_the_rest_race_on()
+	_test_a_death_no_longer_yanks_a_visiting_raider_home()
+	_test_a_dropout_is_marked_out_and_the_match_goes_on()
+	_test_a_snapshot_carries_only_the_board_a_client_draws()
+	_test_the_high_score_list_keeps_five_names_in_order()
+	_test_net_link_assigns_one_slot_per_peer()
+	_test_a_four_player_match_always_settles()
 	_test_snapshot_roundtrip_restores_the_match()
 	_test_snapshot_roundtrip_survives_a_player_mid_raid()
 	_test_net_link_compiles_and_starts_offline()
@@ -1041,7 +1050,7 @@ func _test_snapshot_roundtrip_restores_the_match() -> void:
 	host.advance_time(1.25)
 	host.move_player(0, Vector2i.RIGHT)
 	var client := MatchStateClass.new(0)
-	client.apply_bytes(host.to_bytes())
+	client.apply_bytes(host.to_bytes(0))
 	_expect(client.worlds[0].cells == host.worlds[0].cells, "the board survives the wire")
 	_expect(client.worlds[0].beans == host.worlds[0].beans, "so do the beans")
 	_expect(client.worlds[0].falling_filters == host.worlds[0].falling_filters, "and the filters")
@@ -1062,7 +1071,7 @@ func _test_snapshot_roundtrip_survives_a_player_mid_raid() -> void:
 	_expect(host.world_of_player[1] == 0, "and lands on the rival plantation")
 	raider.score = 4321
 	var client := MatchStateClass.new(0)
-	client.apply_bytes(host.to_bytes())
+	client.apply_bytes(host.to_bytes(0))
 	_expect(client.world_of_player[1] == 0, "the client knows the raider changed worlds")
 	_expect(client.worlds[0].players.size() == 2, "both players share the raided board")
 	_expect(client.players[1].score == 4321, "the raider keeps their score across the wire")
@@ -1079,22 +1088,200 @@ func _test_a_finished_snapshot_ends_the_match_on_the_client() -> void:
 	client.finished.connect(func(who: int) -> void:
 		calls[0] += 1
 		winner[0] = who)
-	client.apply_bytes(host.to_bytes())
+	client.apply_bytes(host.to_bytes(0))
 	_expect(calls[0] == 0, "a running match does not end on the client")
 	host.players[0].lives = 1
 	host.worlds[0].lose_life(0)
 	_expect(host.is_over, "the host settles the match when someone runs out of lives")
-	client.apply_bytes(host.to_bytes())
+	client.apply_bytes(host.to_bytes(0))
 	_expect(calls[0] == 1, "the snapshot that says it is over ends it on the client too")
 	_expect(winner[0] == 1, "and names the same winner the host picked")
-	client.apply_bytes(host.to_bytes())
+	client.apply_bytes(host.to_bytes(0))
 	_expect(calls[0] == 1, "further snapshots do not end it a second time")
+
+
+func _test_the_portal_ring_visits_every_plantation() -> void:
+	var match_state := MatchStateClass.new(9001, 4)
+	match_state.start_game()
+	_expect(match_state.player_count() == 4, "a four-player match grows four plantations")
+	var slot: PlayerSlot = match_state.players[0]
+	for hop in range(4):
+		var world: GameState = match_state.world_for(0)
+		slot.cell = world.portal_cell() - Vector2i.RIGHT
+		world.set_cell(slot.cell, GameStateClass.Cell.TUNNEL)
+		_expect(match_state.move_player(0, Vector2i.RIGHT), "the raider steps into the portal")
+		_expect(match_state.world_of_player[0] == (hop + 1) % 4, "the portal leads to the next plantation in the ring")
+	_expect(match_state.world_of_player[0] == 0, "a full lap of the ring brings the raider home")
+	_expect(match_state.worlds[0].players.has(slot), "and puts them back on their own board")
+
+
+func _test_the_last_player_standing_wins() -> void:
+	var match_state := MatchStateClass.new(4242, 4)
+	match_state.start_game()
+	for player_index in [1, 2]:
+		match_state.players[player_index].lives = 1
+		match_state.worlds[player_index].lose_life(0)
+	_expect(not match_state.is_over, "a four-player race carries on with two players left")
+	_expect(match_state.active_players() == [0, 3], "the pair still in it are the ones with lives")
+	match_state.players[3].score = 99999
+	match_state.players[3].lives = 1
+	match_state.worlds[3].lose_life(0)
+	_expect(match_state.is_over, "the race ends when only one is left")
+	_expect(match_state.winner_index == 0, "surviving beats scoring: the last one standing wins")
+
+
+func _test_an_eliminated_player_leaves_the_board_and_the_rest_race_on() -> void:
+	var match_state := MatchStateClass.new(606, 3)
+	match_state.start_game()
+	var visitor: PlayerSlot = match_state.players[1]
+	var resident: PlayerSlot = match_state.players[0]
+	match_state.worlds[1].players.erase(visitor)
+	match_state.worlds[0].players.append(visitor)
+	match_state.world_of_player[1] = 0
+	visitor.lives = 1
+	match_state.worlds[0].lose_life(match_state.local_index(1))
+	_expect(visitor.is_out, "a player out of lives is out of the match")
+	_expect(not match_state.worlds[0].players.has(visitor), "and off the board they were standing on")
+	_expect(match_state.worlds[0].players.has(resident), "the board keeps whoever is left")
+	_expect(match_state.worlds[0].phase == GameStateClass.Phase.PLAYING, "a board with company keeps running")
+	_expect(not match_state.is_over, "and the others race on")
+	_expect(not match_state.move_player(1, Vector2i.RIGHT), "an eliminated player cannot walk")
+
+
+func _test_a_death_no_longer_yanks_a_visiting_raider_home() -> void:
+	var match_state := MatchStateClass.new(707, 2)
+	match_state.start_game()
+	var raider: PlayerSlot = match_state.players[1]
+	var resident: PlayerSlot = match_state.players[0]
+	match_state.worlds[1].players.erase(raider)
+	match_state.worlds[0].players.append(raider)
+	match_state.world_of_player[1] = 0
+	raider.cell = Vector2i(6, match_state.worlds[0].corridor_y)
+	match_state.worlds[0].set_cell(raider.cell, GameStateClass.Cell.TUNNEL)
+	var raided_cell := raider.cell
+	match_state.worlds[0].lose_life(0)
+	_expect(resident.lives == GameStateClass.START_LIVES - 1, "the resident pays for the contact")
+	_expect(raider.cell == raided_cell, "the raider keeps standing where they were")
+
+
+func _test_a_dropout_is_marked_out_and_the_match_goes_on() -> void:
+	var match_state := MatchStateClass.new(808, 3)
+	match_state.start_game()
+	match_state.eliminate(2)
+	_expect(match_state.players[2].is_out, "a peer that leaves gives up its slot")
+	_expect(not match_state.worlds[2].players.has(match_state.players[2]), "their plantation stands empty")
+	_expect(not match_state.is_over, "two players are still a race")
+	match_state.eliminate(1)
+	_expect(match_state.is_over and match_state.winner_index == 0, "the last one left takes it")
+	match_state.eliminate(1)
+	_expect(match_state.winner_index == 0, "eliminating the same slot twice changes nothing")
+
+
+func _test_a_snapshot_carries_only_the_board_a_client_draws() -> void:
+	var host := MatchStateClass.new(1717, 4)
+	host.start_game()
+	host.players[2].score = 640
+	host.players[2].is_out = true
+	var payload := host.to_bytes(1)
+	# One board, not four: the whole point is staying inside ENet's MTU.
+	_expect(payload.size() < 1392, "a four-player snapshot still fits in one packet")
+	var client := MatchStateClass.new(0, 4)
+	client.apply_bytes(payload)
+	_expect(client.worlds[1].cells == host.worlds[1].cells, "the board the client stands on arrives")
+	_expect(client.players[2].score == 640, "every player standing is reported, wherever they are")
+	_expect(client.players[2].is_out, "including who is already out")
+	_expect(not client.worlds[1].players.has(client.players[2]), "an eliminated slot is on no board")
+	_expect(client.worlds[1].players.size() == 1, "only the players on that board are seated")
+
+
+# Elimination takes slots off a board while the rules are still walking over it,
+# which is exactly the kind of thing that only shows up under load. So: play four
+# whole matches out, blind, and insist every one of them ends properly.
+func _test_a_four_player_match_always_settles() -> void:
+	var random := RandomNumberGenerator.new()
+	var directions := [Vector2i.LEFT, Vector2i.RIGHT, Vector2i.UP, Vector2i.DOWN]
+	for attempt in range(4):
+		random.seed = attempt
+		var match_state := MatchStateClass.new(attempt * 977, 4)
+		match_state.start_game()
+		var client := MatchStateClass.new(0, 4)
+		var ticks := 0
+		var oversize := 0
+		while not match_state.is_over and ticks < 20000:
+			ticks += 1
+			match_state.advance_time(0.016)
+			for world in match_state.worlds:
+				world.tick_contacts()
+			if ticks % 8 == 0:
+				for world in match_state.worlds:
+					world.tick_enemy(&"all")
+					world.tick_filter()
+			for player_index in range(4):
+				if random.randi() % 6 == 0:
+					match_state.move_player(player_index, directions[random.randi() % 4])
+				if random.randi() % 400 == 0:
+					match_state.throw_coffee(player_index)
+			for world_index in range(4):
+				match_state.next_level(world_index)
+			if ticks % 30 == 0:
+				var payload := match_state.to_bytes(match_state.world_of_player[1])
+				if payload.size() >= 1392:
+					oversize += 1
+				client.apply_bytes(payload)
+		_expect(match_state.is_over, "a four-player match always reaches an end")
+		_expect(oversize == 0, "and never packs a snapshot too big for one packet")
+		_expect(match_state.active_players().size() <= 1, "with at most one player left standing")
+		if match_state.winner_index >= 0:
+			_expect(not match_state.players[match_state.winner_index].is_out, "the winner is not one of the eliminated")
+
+
+func _test_the_high_score_list_keeps_five_names_in_order() -> void:
+	var real_path: String = SaveDataClass.path
+	SaveDataClass.path = "user://coffee-hunter-names-test.cfg"
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(SaveDataClass.path))
+	_expect(SaveDataClass.player_name() == SaveDataClass.DEFAULT_NAME, "a fresh install has a stand-in name")
+	SaveDataClass.set_player_name("  marco  ")
+	_expect(SaveDataClass.player_name() == "MARCO", "a name is trimmed and shouted")
+	_expect(SaveDataClass.scores().is_empty(), "nobody has finished a run yet")
+	SaveDataClass.record_run(100, 0)
+	_expect(SaveDataClass.scores()[0]["name"] == "MARCO", "a run without a name takes the saved one")
+	for points in [500, 200, 900, 300, 700]:
+		SaveDataClass.record_run(points, 2, "PAOLO")
+	var entries := SaveDataClass.scores()
+	_expect(entries.size() == SaveDataClass.SCORE_SLOTS, "the table holds five runs")
+	_expect(int(entries[0]["score"]) == 900, "the best run is on top")
+	_expect(int(entries[4]["score"]) == 200, "and the weakest of the five brings up the rear")
+	SaveDataClass.record_run(0, 0)
+	_expect(int(SaveDataClass.scores()[4]["score"]) == 200, "a scoreless run never displaces a real one")
+	# Clearing a level banks the progress; only the end of a run writes a line.
+	SaveDataClass.record_progress(5000, 7)
+	_expect(SaveDataClass.high_score() == 5000 and SaveDataClass.best_level() == 7, "a cleared level banks score and depth")
+	_expect(int(SaveDataClass.scores()[0]["score"]) == 900, "but a run still going never lands in the table")
+	_expect(SaveDataClass.scores().size() == SaveDataClass.SCORE_SLOTS, "and never grows it")
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(SaveDataClass.path))
+	SaveDataClass.path = real_path
+
+
+func _test_net_link_assigns_one_slot_per_peer() -> void:
+	var link := NetLinkClass.new()
+	link.roster = [{"peer_id": 1, "index": 0, "name": "HOST"}]
+	_expect(link._claim_slot(77, "TWO") == 1, "the first guest takes the seat next to the host")
+	_expect(link._claim_slot(78, "THREE") == 2, "the next one sits after them")
+	_expect(link._claim_slot(77, "TWO") == 1, "a peer that announces twice keeps its seat")
+	_expect(link.name_of(2) == "THREE", "the roster can name a player by slot")
+	_expect(link.index_of_peer(78) == 2, "and find a slot by peer")
+	link.roster.remove_at(1)
+	_expect(link._claim_slot(79, "FOUR") == 1, "a seat left empty is filled again")
+	_expect(link._claim_slot(80, "FIVE") == 3, "the fourth player takes the last seat")
+	_expect(link._claim_slot(81, "SIX") == -1, "a fifth is turned away")
+	link.free()
 
 
 func _test_net_link_offers_a_rematch_handshake() -> void:
 	var link := NetLinkClass.new()
 	_expect(link.has_signal("rematch_requested"), "the link carries a rematch request")
-	_expect(link.has_method("send_rematch"), "which either side can send")
+	_expect(link.has_signal("rematch_changed"), "and reports the tally back")
+	_expect(link.has_method("send_rematch"), "which a guest can send")
 	link.send_rematch()
 	_expect(not link.is_online(), "and an offline link quietly ignores it")
 	link.free()
@@ -1104,7 +1291,8 @@ func _test_net_link_compiles_and_starts_offline() -> void:
 	var link := NetLinkClass.new()
 	_expect(link != null, "net_link.gd compiles")
 	_expect(not link.is_online(), "a fresh link is offline")
-	_expect(link.local_player_index() == 1, "an unconnected link speaks for the guest slot")
+	_expect(link.local_player_index() == -1, "an unconnected link holds no slot yet")
+	_expect(NetLinkClass.MAX_PLAYERS == 4, "a plantation race seats four")
 	_expect(NetLinkClass.GAME_PORT != NetLinkClass.DISCOVERY_PORT, "discovery and play use separate ports")
 	link.free()
 

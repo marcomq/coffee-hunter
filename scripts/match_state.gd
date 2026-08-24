@@ -1,9 +1,10 @@
 class_name MatchState
 extends RefCounted
 
-# A competitive two-player match: two plantations grown from one seed, joined by
-# a portal. Each `GameState` still owns its own board and guards; this layer owns
-# the players, moves them between worlds, and settles the race.
+# A competitive match: one plantation per player, all grown from the same seed and
+# joined by portals into a ring. Each `GameState` still owns its own board and
+# guards; this layer owns the players, moves them between worlds, and settles the
+# race.
 
 const GameStateClass = preload("res://scripts/game_state.gd")
 const PlayerSlotClass = preload("res://scripts/player_slot.gd")
@@ -13,7 +14,7 @@ signal changed
 signal event_emitted(kind: StringName, cell: Vector2i, world_index: int, player_index: int)
 signal finished(winner_index: int)
 
-const PLAYER_COUNT := 2
+const MAX_PLAYERS := 4
 const COFFEE_CHARGE_TIME := 3.0
 # A portal hop banks two of the three seconds, so raiding arrives nearly armed.
 const PORTAL_CHARGE_BONUS := 2.0
@@ -34,9 +35,9 @@ var is_over := false
 var winner_index := -1
 
 
-func _init(seed_value := 0) -> void:
+func _init(seed_value := 0, player_count := 2) -> void:
 	match_seed = seed_value
-	for world_index in range(PLAYER_COUNT):
+	for world_index in range(clampi(player_count, 2, MAX_PLAYERS)):
 		var world: GameState = GameStateClass.new(match_seed)
 		worlds.append(world)
 		players.append(world.players[0])
@@ -45,15 +46,20 @@ func _init(seed_value := 0) -> void:
 		world.changed.connect(_on_world_changed)
 
 
+func player_count() -> int:
+	return players.size()
+
+
 func _on_world_changed() -> void:
 	changed.emit()
 
 
 # Worlds speak in board-local player indices; the match speaks in global ones.
 func _on_world_event(kind: StringName, cell: Vector2i, local_index: int, world_index: int) -> void:
-	event_emitted.emit(kind, cell, world_index, _global_index(world_index, local_index))
+	var player_index := _global_index(world_index, local_index)
+	event_emitted.emit(kind, cell, world_index, player_index)
 	if kind == &"game_over":
-		_check_finished()
+		eliminate(player_index)
 
 
 func _global_index(world_index: int, local_index: int) -> int:
@@ -94,12 +100,36 @@ func is_armed(player_index: int) -> bool:
 	return players[player_index].coffee_charge >= COFFEE_CHARGE_TIME
 
 
+# Out of lives, or gone from the link. The slot leaves its board, so everything
+# underneath - enemy targeting, throws, the deadlock rescue - stops seeing it
+# without a single extra check, and the others race on.
+func eliminate(player_index: int) -> void:
+	if player_index < 0 or player_index >= players.size():
+		return
+	var slot: PlayerSlot = players[player_index]
+	if slot.is_out:
+		return
+	slot.is_out = true
+	worlds[world_of_player[player_index]].players.erase(slot)
+	changed.emit()
+	_check_finished()
+
+
+func active_players() -> Array[int]:
+	var active: Array[int] = []
+	for player_index in range(players.size()):
+		if not players[player_index].is_out:
+			active.append(player_index)
+	return active
+
+
 func move_player(player_index: int, direction: Vector2i) -> bool:
 	if is_over:
 		return false
 	var slot: PlayerSlot = players[player_index]
 	var world := world_for(player_index)
 	var local := local_index(player_index)
+	# -1 covers an eliminated slot too: it stands on no board at all.
 	if local < 0:
 		return false
 	if not world.move_player(direction, local):
@@ -112,14 +142,15 @@ func move_player(player_index: int, direction: Vector2i) -> bool:
 	return true
 
 
-# Stepping onto the portal cell drops the player onto the twin cell of the other
-# board. Both worlds share a seed, so the destination is always carved.
+# Stepping onto the portal cell drops the player onto the twin cell of the next
+# board in the ring. Every world shares a seed, so the destination is always
+# carved - and a full lap brings a raider home.
 func _try_portal(player_index: int) -> bool:
 	var slot: PlayerSlot = players[player_index]
 	var from_world := world_of_player[player_index]
 	if slot.cell != worlds[from_world].portal_cell():
 		return false
-	var to_world := 1 - from_world
+	var to_world := (from_world + 1) % worlds.size()
 	worlds[from_world].players.erase(slot)
 	worlds[to_world].players.append(slot)
 	world_of_player[player_index] = to_world
@@ -135,7 +166,7 @@ func _try_portal(player_index: int) -> bool:
 
 
 func throw_coffee(player_index: int) -> bool:
-	if is_over or not is_armed(player_index):
+	if is_over or not is_armed(player_index) or players[player_index].is_out:
 		return false
 	var world := world_for(player_index)
 	if world.phase != GameStateClass.Phase.PLAYING:
@@ -201,25 +232,35 @@ func next_level(player_index: int) -> bool:
 	return true
 
 
+# Survival first: whoever is left when everyone else is out wins the race no
+# matter what the scores say. Only a match that runs its full length is settled
+# on points.
 func _check_finished() -> void:
 	if is_over:
 		return
-	for player_index in range(PLAYER_COUNT):
-		if players[player_index].lives <= 0:
-			_finish(1 - player_index)
-			return
-	for world in worlds:
+	var active := active_players()
+	if active.size() <= 1:
+		_finish(active[0] if not active.is_empty() else -1)
+		return
+	for player_index in active:
+		var world: GameState = worlds[player_index]
 		var cleared: bool = world.level_index + 1 >= LevelDataClass.MATCH_LEVELS and world.phase == GameStateClass.Phase.WON
 		if not cleared:
 			return
 	_finish(leader())
 
 
-# -1 on a draw.
+# -1 on a tie at the top.
 func leader() -> int:
-	if players[0].score == players[1].score:
-		return -1
-	return 0 if players[0].score > players[1].score else 1
+	var best := -1
+	var tied := false
+	for player_index in range(players.size()):
+		if best < 0 or players[player_index].score > players[best].score:
+			best = player_index
+			tied = false
+		elif players[player_index].score == players[best].score:
+			tied = true
+	return -1 if tied else best
 
 
 func _finish(winner: int) -> void:
@@ -229,55 +270,73 @@ func _finish(winner: int) -> void:
 
 
 # --- network snapshots -------------------------------------------------------
-# Players are serialised here rather than per world, because a slot belongs to
-# the match and merely stands on a board. Only what a client has to DRAW travels.
+# A client only ever draws the one board it is standing on, so only that board
+# travels - sending every plantation would burst the MTU that `to_snapshot` packs
+# so carefully for as soon as a third player joins. The players are serialised
+# here rather than per world, because a slot belongs to the match and merely
+# stands on a board.
+
+const SLOT_INTS := 6
+const SLOT_TIMERS := 2
 
 
-func to_bytes() -> PackedByteArray:
-	var payload: Array = []
-	for world in worlds:
-		payload.append(world.to_snapshot())
-	var packed_players: Array = []
+func to_bytes(world_index: int) -> PackedByteArray:
+	var packed_players := PackedInt32Array()
+	var packed_timers := PackedFloat32Array()
 	for slot in players:
-		packed_players.append([
-			slot.cell.x, slot.cell.y, slot.facing.x, slot.facing.y,
-			slot.score, slot.lives, slot.coffee_charge, slot.invulnerable_until,
-		])
-	payload.append(packed_players)
-	payload.append(world_of_player.duplicate())
-	payload.append(match_seed)
-	payload.append(is_over)
-	payload.append(winner_index)
-	return var_to_bytes(payload)
+		packed_players.append(slot.cell.y * GameStateClass.WIDTH + slot.cell.x)
+		packed_players.append(slot.facing.x)
+		packed_players.append(slot.facing.y)
+		packed_players.append(slot.score)
+		packed_players.append(slot.lives)
+		packed_players.append(1 if slot.is_out else 0)
+		packed_timers.append(slot.coffee_charge)
+		packed_timers.append(slot.invulnerable_until)
+	return var_to_bytes([
+		world_index,
+		worlds[world_index].to_snapshot(),
+		packed_players,
+		packed_timers,
+		world_of_player.duplicate(),
+		match_seed,
+		is_over,
+		winner_index,
+	])
 
 
 func apply_bytes(payload: PackedByteArray) -> void:
 	var snapshot: Variant = bytes_to_var(payload)
-	if not (snapshot is Array) or (snapshot as Array).size() < PLAYER_COUNT + 5:
+	if not (snapshot is Array) or (snapshot as Array).size() < 8:
 		return
 	var parts: Array = snapshot
+	var world_index: int = parts[0]
+	if world_index < 0 or world_index >= worlds.size():
+		return
 	var was_over := is_over
-	for world_index in range(PLAYER_COUNT):
-		worlds[world_index].apply_snapshot(parts[world_index])
-	var packed_players: Array = parts[PLAYER_COUNT]
-	world_of_player.assign(parts[PLAYER_COUNT + 1])
-	match_seed = parts[PLAYER_COUNT + 2]
-	is_over = parts[PLAYER_COUNT + 3]
-	winner_index = parts[PLAYER_COUNT + 4]
+	worlds[world_index].apply_snapshot(parts[1])
+	var packed_players: PackedInt32Array = parts[2]
+	var packed_timers: PackedFloat32Array = parts[3]
+	world_of_player.assign(parts[4])
+	match_seed = parts[5]
+	is_over = parts[6]
+	winner_index = parts[7]
 	# Slots are rebuilt in place so the render layer keeps its references, then
-	# re-seated on the boards the host says they are standing on.
-	for world in worlds:
-		world.players.clear()
-	for player_index in range(mini(players.size(), packed_players.size())):
-		var values: Array = packed_players[player_index]
+	# re-seated on the board that travelled. The other plantations keep whatever
+	# they last held; a client never draws them.
+	worlds[world_index].players.clear()
+	var count := mini(players.size(), packed_players.size() / SLOT_INTS)
+	for player_index in range(count):
+		var base := player_index * SLOT_INTS
 		var slot: PlayerSlot = players[player_index]
-		slot.cell = Vector2i(values[0], values[1])
-		slot.facing = Vector2i(values[2], values[3])
-		slot.score = values[4]
-		slot.lives = values[5]
-		slot.coffee_charge = values[6]
-		slot.invulnerable_until = values[7]
-		worlds[world_of_player[player_index]].players.append(slot)
+		slot.cell = worlds[world_index].cell_of(packed_players[base])
+		slot.facing = Vector2i(packed_players[base + 1], packed_players[base + 2])
+		slot.score = packed_players[base + 3]
+		slot.lives = packed_players[base + 4]
+		slot.is_out = packed_players[base + 5] != 0
+		slot.coffee_charge = packed_timers[player_index * SLOT_TIMERS]
+		slot.invulnerable_until = packed_timers[player_index * SLOT_TIMERS + 1]
+		if not slot.is_out and world_of_player[player_index] == world_index:
+			worlds[world_index].players.append(slot)
 	changed.emit()
 	# A client never runs `_check_finished`, so the end of the match reaches it
 	# only here - as the moment the host's snapshot first says it is over.

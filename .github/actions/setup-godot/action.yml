@@ -1,0 +1,60 @@
+name: Setup Godot
+description: Installs the Godot editor binary and, optionally, the export templates.
+
+inputs:
+  version:
+    description: Godot version, e.g. 4.7.2
+    required: true
+  templates:
+    description: Also install the export templates (~1 GB download)
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Cache Godot editor
+      id: cache-editor
+      uses: actions/cache@v4
+      with:
+        path: ~/godot-bin
+        key: godot-editor-${{ inputs.version }}-linux
+
+    - name: Download Godot editor
+      if: steps.cache-editor.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        V="${{ inputs.version }}"
+        mkdir -p ~/godot-bin
+        curl -fsSL -o /tmp/godot.zip \
+          "https://github.com/godotengine/godot/releases/download/${V}-stable/Godot_v${V}-stable_linux.x86_64.zip"
+        unzip -q /tmp/godot.zip -d /tmp/godot-extract
+        mv "/tmp/godot-extract/Godot_v${V}-stable_linux.x86_64" ~/godot-bin/godot
+        chmod +x ~/godot-bin/godot
+
+    - name: Put Godot on PATH
+      shell: bash
+      run: echo "$HOME/godot-bin" >> "$GITHUB_PATH"
+
+    - name: Cache export templates
+      if: inputs.templates == 'true'
+      id: cache-templates
+      uses: actions/cache@v4
+      with:
+        path: ~/.local/share/godot/export_templates
+        key: godot-templates-${{ inputs.version }}
+
+    - name: Download export templates
+      if: inputs.templates == 'true' && steps.cache-templates.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        V="${{ inputs.version }}"
+        curl -fsSL -o /tmp/templates.tpz \
+          "https://github.com/godotengine/godot/releases/download/${V}-stable/Godot_v${V}-stable_export_templates.tpz"
+        unzip -q /tmp/templates.tpz -d /tmp/tpz
+        mkdir -p ~/.local/share/godot/export_templates
+        mv /tmp/tpz/templates ~/.local/share/godot/export_templates/"${V}.stable"
+
+    - name: Import project resources
+      shell: bash
+      run: godot --headless --path . --import

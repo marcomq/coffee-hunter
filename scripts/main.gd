@@ -14,6 +14,9 @@ const PLAYER_STEP_TIME := GameStateClass.PLAYER_STEP_TIME
 const ENEMY_STEP_TIME := GameStateClass.ENEMY_STEP_TIME
 const FILTER_STEP_TIME := GameStateClass.FILTER_STEP_TIME
 const HERO_TEXTURE := "res://assets/art/source/hero-walk-sheet-v1.png"
+const HERO_COFFEE_CHARGE_TEXTURE := "res://assets/art/source/hero-coffee-charge-sheet-v1.png"
+const HERO_COFFEE_THROW_TEXTURE := "res://assets/art/source/hero-coffee-throw-sheet-v1.png"
+const COFFEE_THROW_TIME := 0.24
 const TEAPOD_FALLBACK_TEXTURE := "res://assets/art/source/tea-filter-sheet-v2.png"
 const BEAN_TEXTURES := [
 	"res://assets/art/source/coffee-bean-single-v2.png",
@@ -53,7 +56,9 @@ enum UiMode { TITLE, LOBBY, PLAYING, PAUSED, GAME_OVER }
 # The host simulates and ships state at this rate; the client only draws. Actor
 # tweens already smooth between cells, so a faster stream would buy nothing.
 const SNAPSHOT_INTERVAL := 1.0 / 15.0
-const RIVAL_TINT := Color("9ed6f0")
+# One colour per slot, so the figure on the board and the line in the side panel
+# read as the same person. Slot 0 keeps the untinted hero.
+const PLAYER_TINTS: Array[Color] = [Color.WHITE, Color("9ed6f0"), Color("a8e6a0"), Color("f0a8d8")]
 
 var state: GameState
 var resolver: InputResolver
@@ -69,7 +74,7 @@ var score_label: Label
 var lives_label: Label
 var beans_label: Label
 var status_label: Label
-var rival_label: Label
+var roster_label: RichTextLabel
 var move_cooldown := 0.0
 var enemy_cooldown := ENEMY_STEP_TIME
 var teapot_cooldown := ENEMY_STEP_TIME
@@ -98,22 +103,23 @@ var best_level := 0
 var match_state: MatchState
 var net: NetLink
 var local_player := 0
-var rival_node: Node2D
+var rival_nodes: Array[Node2D] = []
 var charge_ring: Line2D
+var coffee_throw_until: Dictionary[int, float] = {}
 var shown_world := -1
 var snapshot_countdown := 0.0
-# The guest ships its intent every frame. The host stores the latest one and
-# walks it on its own step clock, otherwise one keypress would be one step per
-# packet.
-var remote_direction := Vector2i.ZERO
-var remote_throw := false
-var remote_move_cooldown := 0.0
+# Every guest ships its intent each frame. The host stores the latest one per
+# player and walks it on its own step clock, otherwise one keypress would be one
+# step per packet. Indexed by global player index; the local entry stays unused.
+var remote_direction: Array[Vector2i] = []
+var remote_throw: Array[bool] = []
+var remote_move_cooldown: Array[float] = []
 var portal_node: Node2D
-# A rematch starts only once both sides have said yes.
-var rematch_ready := false
-var rematch_remote := false
+# A rematch starts only once everybody has said yes.
+var rematch_ready: Array[bool] = []
 var lobby_address: LineEdit
 var lobby_list: Label
+var name_field: LineEdit
 
 
 func _ready() -> void:
@@ -195,18 +201,27 @@ func _build_hud() -> void:
 	best_label.position = Vector2(850, 214)
 	best_label.size = Vector2(102, 24)
 	add_child(best_label)
-	# Tinted like the rival sprite, so the two read as the same person.
-	rival_label = _label("", 16, RIVAL_TINT)
-	rival_label.position = Vector2(850, 250)
-	rival_label.size = Vector2(102, 88)
-	rival_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	rival_label.visible = false
-	add_child(rival_label)
+	# Rich text, because every player is named in their own colour - the same one
+	# their figure wears on the board.
+	roster_label = _rich_label(13)
+	roster_label.position = Vector2(850, 238)
+	roster_label.size = Vector2(102, 150)
+	roster_label.visible = false
+	add_child(roster_label)
 	status_label = _label("", 16, Color("d9efb3"))
 	status_label.position = Vector2(850, 252)
 	status_label.size = Vector2(102, 130)
 	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	add_child(status_label)
+
+func _rich_label(size: int) -> RichTextLabel:
+	var label := RichTextLabel.new()
+	label.bbcode_enabled = true
+	label.scroll_active = false
+	label.add_theme_font_size_override("normal_font_size", size)
+	label.add_theme_color_override("default_color", Color("f0e3d2"))
+	return label
+
 
 func _label(text: String, size: int, color: Color) -> Label:
 	var label := Label.new()
@@ -246,11 +261,31 @@ func _build_overlay() -> void:
 	lobby_address = LineEdit.new()
 	lobby_address.position = Vector2(330, 452)
 	lobby_address.size = Vector2(300, 34)
-	lobby_address.placeholder_text = "IP eintippen (z.B. 192.168.1.20)"
+	lobby_address.placeholder_text = "Type an IP (e.g. 192.168.1.20)"
 	lobby_address.alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lobby_address.visible = false
 	lobby_address.text_submitted.connect(_on_address_submitted)
 	overlay.add_child(lobby_address)
+	# Never focused on its own: a focused field swallows every shortcut, which is
+	# exactly how the lobby once ate the H for hosting.
+	name_field = LineEdit.new()
+	name_field.position = Vector2(380, 490)
+	name_field.size = Vector2(200, 34)
+	name_field.max_length = SaveDataClass.NAME_LENGTH
+	name_field.placeholder_text = "Your name"
+	name_field.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	name_field.text = SaveDataClass.player_name()
+	name_field.visible = false
+	name_field.text_submitted.connect(_on_name_submitted)
+	var name_hint := _label("YOUR NAME", 15, Color("9ec9d6"))
+	name_hint.position = Vector2(150, 496)
+	name_hint.size = Vector2(220, 24)
+	name_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	name_field.visibility_changed.connect(func() -> void: name_hint.visible = name_field.visible)
+	name_hint.visible = false
+	overlay.add_child(name_hint)
+	name_field.focus_exited.connect(_save_player_name)
+	overlay.add_child(name_field)
 
 
 func _build_net() -> void:
@@ -258,20 +293,24 @@ func _build_net() -> void:
 	net.name = "NetLink"
 	add_child(net)
 	net.lobby_changed.connect(_refresh_lobby_list)
+	net.roster_changed.connect(_refresh_lobby_list)
 	net.link_ready.connect(_on_link_ready)
 	net.link_lost.connect(_on_link_lost)
+	net.player_left.connect(_on_player_left)
 	net.match_started.connect(_on_match_started)
 	net.snapshot_received.connect(_on_snapshot_received)
 	net.event_received.connect(_on_remote_event)
 	net.input_received.connect(_on_remote_input)
 	net.rematch_requested.connect(_on_rematch_requested)
+	net.rematch_changed.connect(_on_rematch_changed)
 
 
 func _show_lobby() -> void:
 	ui_mode = UiMode.LOBBY
 	overlay.visible = true
-	overlay_title.text = "ZWEI PLANTAGEN"
-	overlay_body.text = "Ein Wettrennen um die Bohnen, verbunden durch ein Portal.\n\nH  Spiel hosten und auf einen Gegner warten\nESC  zurueck zum Titel"
+	name_field.visible = false
+	overlay_title.text = "PLANTATION RACE"
+	overlay_body.text = "Up to four plantations, linked in a ring by portals.\n\nH  host a game and wait for players\nESC  back to the title"
 	lobby_list.visible = true
 	lobby_address.visible = true
 	net.start_browsing()
@@ -285,63 +324,92 @@ func _hide_lobby_widgets() -> void:
 		net.stop_browsing()
 
 
+# One label, two jobs: the games out on the network before joining, the players
+# in the room afterwards.
 func _refresh_lobby_list() -> void:
 	if ui_mode != UiMode.LOBBY:
 		return
-	if net.found_games.is_empty():
-		lobby_list.text = "Suche im lokalen Netz...\n(oder unten ins Feld klicken, Adresse eintippen, ENTER)"
+	if net.is_online():
+		_show_waiting_room()
 		return
-	var lines := "Gefundene Spiele - Zifferntaste zum Beitreten:\n"
+	if net.found_games.is_empty():
+		lobby_list.text = "Searching the local network...\n(or click the field below, type an address, ENTER)"
+		return
+	var lines := "Games found - press a number key to join:\n"
 	for index in range(mini(net.found_games.size(), 9)):
 		var entry: Dictionary = net.found_games[index]
-		lines += "%d)  %s   %s\n" % [index + 1, entry["name"], entry["address"]]
+		lines += "%d)  %s   %s   (%d/%d)\n" % [
+			index + 1, entry["name"], entry["address"],
+			int(entry.get("players", 1)), NetLinkClass.MAX_PLAYERS,
+		]
 	lobby_list.text = lines
+
+
+# Nobody drops into a race unannounced: the host waits until the room is as full
+# as it is going to get and says when.
+func _show_waiting_room() -> void:
+	overlay_title.text = "WAITING ROOM"
+	var lines := ""
+	for entry in net.roster:
+		var mark := "   (you)" if int(entry["index"]) == local_player else ""
+		lines += "%d)  %s%s\n" % [int(entry["index"]) + 1, entry["name"], mark]
+	lobby_list.text = lines
+	if not net.is_host():
+		overlay_body.text = "%s\n\nThe host starts the race.      ESC to cancel" % net.status_text
+	elif net.roster.size() >= 2:
+		overlay_body.text = "%d of %d players here.\n\nSPACE starts the race      ESC to cancel" % [
+			net.roster.size(), NetLinkClass.MAX_PLAYERS,
+		]
+	else:
+		overlay_body.text = "Waiting for players...\n\nESC to cancel"
 
 
 func _on_address_submitted(address: String) -> void:
 	if address.strip_edges() == "":
 		return
-	if not net.join(address):
-		overlay_body.text = net.status_text
-		return
+	net.join(address, SaveDataClass.player_name())
 	overlay_body.text = net.status_text
 
 
-# Both sides land here once the link stands. The host owns the seed and tells the
-# guest, so that both grow the very same pair of plantations.
+# Both sides land here once the link stands: the host right away, a guest the
+# moment the roster hands it a slot - and again if a rematch renumbers the slots.
+# Nobody starts a match here; the host does that from the waiting room.
 func _on_link_ready(player_index: int) -> void:
 	local_player = player_index
-	_hide_lobby_widgets()
-	if net.is_host():
-		var seed_value := randi() & 0x7fffffff
-		_begin_match(seed_value)
-		net.broadcast_match_start(seed_value)
-	else:
-		overlay_title.text = "VERBUNDEN"
-		overlay_body.text = "Warte auf den Host..."
+	lobby_address.visible = false
+	_refresh_lobby_list()
 
 
-func _on_match_started(seed_value: int) -> void:
+func _on_match_started(seed_value: int, player_count: int) -> void:
 	local_player = net.local_player_index()
-	_begin_match(seed_value)
+	_begin_match(seed_value, player_count)
 
 
-func _begin_match(seed_value: int) -> void:
+func _begin_match(seed_value: int, player_count: int) -> void:
 	audio.play(&"start")
+	coffee_throw_until.clear()
 	ui_mode = UiMode.PLAYING
 	overlay.visible = false
 	_hide_lobby_widgets()
-	match_state = MatchStateClass.new(seed_value)
+	# The room is shut for the duration: a latecomer would hold up the rematch.
+	net.accepting = false
+	match_state = MatchStateClass.new(seed_value, player_count)
+	# A guest without a seat would index straight out of the player list.
+	local_player = clampi(local_player, 0, match_state.player_count() - 1)
 	match_state.event_emitted.connect(_on_match_event)
 	match_state.finished.connect(_on_match_finished)
 	match_state.start_game()
 	shown_world = -1
 	snapshot_countdown = 0.0
-	remote_direction = Vector2i.ZERO
-	remote_throw = false
-	remote_move_cooldown = 0.0
-	rematch_ready = false
-	rematch_remote = false
+	var count := match_state.player_count()
+	remote_direction.resize(count)
+	remote_direction.fill(Vector2i.ZERO)
+	remote_throw.resize(count)
+	remote_throw.fill(false)
+	remote_move_cooldown.resize(count)
+	remote_move_cooldown.fill(0.0)
+	rematch_ready.resize(count)
+	rematch_ready.fill(false)
 	_switch_to_world(match_state.world_of_player[local_player])
 
 
@@ -349,7 +417,15 @@ func _on_link_lost(reason: String) -> void:
 	match_state = null
 	_show_title()
 	overlay_title.text = "VERBINDUNG WEG"
-	overlay_body.text = "%s\n\nSPACE fuer einen neuen Anlauf      ESC fuer den Titel" % reason
+	overlay_body.text = "%s\n\nSPACE for a new run      ESC for the title" % reason
+
+
+# A quitter only vacates their own plantation; the rest of the race carries on,
+# and the match settles itself once too few are left.
+func _on_player_left(player_index: int) -> void:
+	if match_state == null:
+		return
+	match_state.eliminate(player_index)
 
 
 func _on_snapshot_received(payload: PackedByteArray) -> void:
@@ -363,15 +439,17 @@ func _on_snapshot_received(payload: PackedByteArray) -> void:
 		_refresh()
 
 
-# Intent only: acting on it here would step the guest once per arriving packet,
+# Intent only: acting on it here would step that guest once per arriving packet,
 # which is 60 steps a second. `_process_match` spends it on the step clock.
 func _on_remote_input(player_index: int, direction: Vector2i, throw_pressed: bool) -> void:
 	if match_state == null or not net.is_host() or player_index == local_player:
 		return
-	remote_direction = direction
+	if player_index < 0 or player_index >= remote_direction.size():
+		return
+	remote_direction[player_index] = direction
 	# Latched: the press lives for one client frame, the host consumes it on its
 	# next tick.
-	remote_throw = remote_throw or throw_pressed
+	remote_throw[player_index] = remote_throw[player_index] or throw_pressed
 
 
 func _on_remote_event(kind: StringName, cell: Vector2i, world_index: int, player_index: int) -> void:
@@ -379,7 +457,7 @@ func _on_remote_event(kind: StringName, cell: Vector2i, world_index: int, player
 
 
 # Only what happens on the board being drawn may fire sound and particles; the
-# rival plantation ticks away off-screen and must stay silent.
+# other plantations tick away off-screen and must stay silent.
 func _on_match_event(kind: StringName, cell: Vector2i, world_index: int, player_index: int) -> void:
 	if net != null and net.is_host():
 		net.broadcast_event(kind, cell, world_index, player_index)
@@ -393,64 +471,130 @@ func _on_match_finished(winner: int) -> void:
 		return
 	ui_mode = UiMode.GAME_OVER
 	overlay.visible = true
-	rematch_ready = false
-	rematch_remote = false
+	rematch_ready.fill(false)
 	if winner < 0:
-		overlay_title.text = "UNENTSCHIEDEN"
+		overlay_title.text = "DRAW"
 	elif winner == local_player:
-		overlay_title.text = "GEWONNEN"
+		overlay_title.text = "YOU WIN"
 	else:
-		overlay_title.text = "VERLOREN"
-	# The host stops simulating the moment the overlay is up, so the snapshot
-	# that carries `is_over` has to go out now - the next scheduled one never
-	# comes, and without it the guest keeps staring at a frozen board.
+		overlay_title.text = "YOU LOSE"
+	# The host stops simulating the moment the overlay is up, so the snapshot that
+	# carries `is_over` has to go out now - the next scheduled one never comes, and
+	# without it a guest keeps staring at a frozen board.
 	if net != null and net.is_host():
-		net.broadcast_snapshot(match_state.to_bytes())
+		_send_snapshots()
 	_show_match_result()
+
+
+# Every guest gets exactly the plantation it is standing on. Four whole boards
+# would not fit in one packet, and it would never draw the other three anyway.
+func _send_snapshots() -> void:
+	for entry in net.guests():
+		var player_index := int(entry["index"])
+		if player_index < 0 or player_index >= match_state.world_of_player.size():
+			continue
+		net.send_snapshot(int(entry["peer_id"]), match_state.to_bytes(match_state.world_of_player[player_index]))
+
+
+func _player_name(player_index: int) -> String:
+	if net != null and net.is_online():
+		return net.name_of(player_index)
+	return "PLAYER %d" % (player_index + 1)
 
 
 func _show_match_result() -> void:
 	if match_state == null:
 		return
-	var mine: PlayerSlot = match_state.players[local_player]
-	var theirs: PlayerSlot = match_state.players[1 - local_player]
-	overlay_body.text = "DU  %d Punkte, %d Leben      GEGNER  %d Punkte, %d Leben\n\n%s" % [
-		mine.score, mine.lives, theirs.score, theirs.lives, _rematch_line(),
-	]
+	var order := range(match_state.player_count())
+	order.sort_custom(func(a: int, b: int) -> bool: return match_state.players[a].score > match_state.players[b].score)
+	var lines := ""
+	for place in range(order.size()):
+		var player_index: int = order[place]
+		var slot: PlayerSlot = match_state.players[player_index]
+		var standing := "out" if slot.is_out else _lives_text(slot.lives)
+		var mark := "   <- you" if player_index == local_player else ""
+		lines += "%d.  %s   %d points   %s%s\n" % [place + 1, _player_name(player_index), slot.score, standing, mark]
+	overlay_body.text = "%s\n%s" % [lines, _rematch_line()]
+
+
+func _lives_text(lives: int) -> String:
+	return "1 life" if lives == 1 else "%d lives" % lives
+
+
+# Only whoever is still on the link can agree; a seat vacated mid-race must not
+# hold the next one hostage.
+func _rematch_pending() -> Array[String]:
+	var waiting: Array[String] = []
+	for entry in net.roster:
+		var player_index := int(entry["index"])
+		if player_index < rematch_ready.size() and not rematch_ready[player_index]:
+			waiting.append(String(entry["name"]))
+	return waiting
 
 
 func _rematch_line() -> String:
 	if net == null or not net.is_online():
-		return "SPACE fuer einen neuen Anlauf      ESC fuer den Titel"
-	var mine := "bereit" if rematch_ready else "SPACE druecken"
-	var theirs := "bereit" if rematch_remote else "wartet noch"
-	return "REVANCHE - beide muessen bestaetigen\nDu: %s      Gegner: %s\n\nESC fuer den Titel" % [mine, theirs]
+		return "SPACE for a new run      ESC for the title"
+	if net.roster.size() < 2:
+		return "Nobody left to race.\n\nESC for the title"
+	var waiting := _rematch_pending()
+	if waiting.is_empty():
+		return "REMATCH - everybody is ready!"
+	return "REMATCH - press SPACE.  Still missing: %s\n\nESC for the title" % ", ".join(waiting)
 
 
-# Announcing is all a guest can do; the seed belongs to the host.
+# Announcing is all a guest can do; the tally and the seed belong to the host.
 func _request_rematch() -> void:
-	if rematch_ready or net == null or not net.is_online():
+	if net == null or not net.is_online():
 		return
-	rematch_ready = true
-	net.send_rematch()
+	if local_player < 0 or local_player >= rematch_ready.size() or rematch_ready[local_player]:
+		return
+	rematch_ready[local_player] = true
 	_show_match_result()
+	if net.is_host():
+		_publish_rematch()
+	else:
+		net.send_rematch()
+
+
+func _publish_rematch() -> void:
+	var flags := PackedByteArray()
+	for is_ready in rematch_ready:
+		flags.append(1 if is_ready else 0)
+	net.broadcast_rematch(flags)
 	_start_rematch_if_agreed()
 
 
-func _on_rematch_requested() -> void:
-	if ui_mode != UiMode.GAME_OVER or match_state == null:
+func _on_rematch_requested(player_index: int) -> void:
+	if ui_mode != UiMode.GAME_OVER or match_state == null or not net.is_host():
 		return
-	rematch_remote = true
+	if player_index < 0 or player_index >= rematch_ready.size():
+		return
+	rematch_ready[player_index] = true
 	_show_match_result()
-	_start_rematch_if_agreed()
+	_publish_rematch()
+
+
+func _on_rematch_changed(flags: PackedByteArray) -> void:
+	if match_state == null:
+		return
+	for player_index in range(mini(flags.size(), rematch_ready.size())):
+		rematch_ready[player_index] = flags[player_index] != 0
+	if ui_mode == UiMode.GAME_OVER:
+		_show_match_result()
 
 
 func _start_rematch_if_agreed() -> void:
-	if not rematch_ready or not rematch_remote or not net.is_host():
+	if not net.is_host() or net.roster.size() < 2 or not _rematch_pending().is_empty():
 		return
+	# Seats left empty by quitters are closed up first, so the next match can keep
+	# counting its players 0..n-1.
+	net.compact_slots()
+	local_player = net.local_player_index()
 	var seed_value := randi() & 0x7fffffff
-	_begin_match(seed_value)
-	net.broadcast_match_start(seed_value)
+	var count := net.roster.size()
+	net.broadcast_match_start(seed_value, count)
+	_begin_match(seed_value, count)
 
 
 # The rendered world is swapped wholesale on a portal hop: every actor teleports,
@@ -472,16 +616,43 @@ func _switch_to_world(world_index: int) -> void:
 func _show_title() -> void:
 	ui_mode = UiMode.TITLE
 	overlay.visible = true
+	name_field.visible = true
 	overlay_title.text = "COFFEE HUNTER"
-	var record := "NO RUN RECORDED YET"
-	if high_score > 0:
-		record = "BEST  %d      FURTHEST  LEVEL %d" % [high_score, best_level + 1]
-	overlay_body.text = "Grounds for Adventure\n\n%s\n\nWASD or ARROWS to dig, or drag the mouse to tilt\nShove a coffee filter onto a tea-pod to squash it\nCatch several pods in one drop and the payout doubles\n\nP pause      R restart      M mute      ESC title\n\nSPACE  Einzelspieler      N  Netzwerk-Wettrennen" % record
+	overlay_body.text = "Grounds for Adventure\n\n%s\n\nWASD / ARROWS to dig  -  drag the mouse to tilt\nSPACE  single player    N  network race    P pause  R restart  M mute" % _high_score_lines()
+
+
+# The five best runs. Only single-player runs land here: match scores carry stolen
+# points and would not compare with them.
+func _high_score_lines() -> String:
+	var entries := SaveDataClass.scores()
+	if entries.is_empty():
+		return "NO RUN RECORDED YET"
+	var lines: Array[String] = ["HIGH SCORES"]
+	for place in range(entries.size()):
+		var entry: Dictionary = entries[place]
+		lines.append("%d.  %s   %d   Level %d" % [
+			place + 1, entry.get("name", "?"), int(entry["score"]), int(entry.get("level", 0)) + 1,
+		])
+	return "\n".join(lines)
+
+
+func _on_name_submitted(_text: String) -> void:
+	_save_player_name()
+	# Handing focus back is what lets SPACE and N work again.
+	name_field.release_focus()
+
+
+func _save_player_name() -> void:
+	SaveDataClass.set_player_name(name_field.text)
+	name_field.text = SaveDataClass.player_name()
+	if ui_mode == UiMode.TITLE:
+		_show_title()
 
 
 func _show_game_over(is_record: bool) -> void:
 	ui_mode = UiMode.GAME_OVER
 	overlay.visible = true
+	name_field.visible = false
 	overlay_title.text = "FILTERED OUT"
 	var record := "SCORE  %d      BEST  %d" % [state.score, high_score]
 	if is_record:
@@ -492,6 +663,7 @@ func _show_game_over(is_record: bool) -> void:
 func _set_paused(paused: bool) -> void:
 	ui_mode = UiMode.PAUSED if paused else UiMode.PLAYING
 	overlay.visible = paused
+	name_field.visible = false
 	audio.play(&"ui")
 	if paused:
 		overlay_title.text = "PAUSED"
@@ -514,16 +686,31 @@ func _toggle_mute() -> void:
 		audio.play(&"ui")
 
 
+# A cleared level banks the progress but does not close the run - the table gets
+# its line when the run actually ends, once.
+func _record_progress() -> void:
+	SaveDataClass.record_progress(state.score, state.level_index)
+	_remember_best()
+
+
 func _record_run() -> bool:
-	var is_record := SaveDataClass.record_run(state.score, state.level_index)
+	var is_record := SaveDataClass.record_run(state.score, state.level_index, SaveDataClass.player_name())
+	_remember_best()
+	return is_record
+
+
+func _remember_best() -> void:
 	high_score = maxi(high_score, state.score)
 	best_level = maxi(best_level, state.level_index)
-	return is_record
 
 
 # True while a menu owns the frame, which is also what freezes the simulation.
 func _handle_ui_input() -> bool:
 	if ui_mode == UiMode.TITLE:
+		# A focused field swallows typing, so the shortcuts stand down while the
+		# name is being edited.
+		if name_field.has_focus():
+			return true
 		if Input.is_action_just_pressed("confirm"):
 			_begin_run()
 		elif Input.is_key_pressed(KEY_N):
@@ -567,6 +754,10 @@ func _handle_ui_input() -> bool:
 
 func _handle_lobby_input() -> void:
 	if Input.is_action_just_pressed("to_title"):
+		# Leaving the waiting room has to drop the link too, or the peer keeps
+		# running behind the title screen.
+		if net.is_online():
+			net.disconnect_link()
 		_hide_lobby_widgets()
 		_show_title()
 		return
@@ -578,26 +769,32 @@ func _handle_lobby_input() -> void:
 	# Raw keys have no just_pressed helper: without this a held key would rebuild
 	# the peer every frame.
 	if net.is_online():
+		# Only the host may call the start, and never on an empty room.
+		if net.is_host() and net.roster.size() >= 2 and Input.is_action_just_pressed("confirm"):
+			var seed_value := randi() & 0x7fffffff
+			var count := net.roster.size()
+			net.broadcast_match_start(seed_value, count)
+			_begin_match(seed_value, count)
 		return
 	if Input.is_key_pressed(KEY_H):
-		if net.host():
-			overlay_body.text = net.status_text
-		else:
-			overlay_body.text = net.status_text
+		net.host(SaveDataClass.player_name())
+		overlay_body.text = net.status_text
 		return
 	for slot in range(mini(net.found_games.size(), 9)):
 		if Input.is_key_pressed(KEY_1 + slot):
 			var entry: Dictionary = net.found_games[slot]
-			net.join(String(entry["address"]))
+			net.join(String(entry["address"]), SaveDataClass.player_name())
 			overlay_body.text = net.status_text
 			return
 
 
 func _leave_match() -> void:
-	if net != null and net.is_online():
-		net.disconnect_link()
-	rematch_ready = false
-	rematch_remote = false
+	if net != null:
+		net.accepting = true
+		if net.is_online():
+			net.disconnect_link()
+	rematch_ready.clear()
+	coffee_throw_until.clear()
 	match_state = null
 	shown_world = -1
 	state = GameStateClass.new()
@@ -623,7 +820,7 @@ func _process(delta: float) -> void:
 			_update_enemy_frame(enemy_node, enemy_index)
 	_update_shake(delta)
 	_animate_filters()
-	_update_rival_node()
+	_update_rival_nodes()
 	_update_charge_ring()
 	_animate_portal()
 	queue_redraw()
@@ -645,7 +842,7 @@ func _physics_process(delta: float) -> void:
 		return
 
 	if state.phase == GameStateClass.Phase.WON and direction != Vector2i.ZERO:
-		_record_run()
+		_record_progress()
 		if state.next_level():
 			_reset_level_view()
 			return
@@ -722,6 +919,10 @@ func _refresh() -> void:
 	if not is_instance_valid(player_node):
 		player_node = _hero_node()
 		actors.add_child(player_node)
+	player_node.modulate = _local_tint()
+	# An eliminated player watches from where they fell; the figure stays gone.
+	if match_state != null and match_state.players[local_player].is_out:
+		player_node.visible = false
 	_update_hero_frame()
 	_move_actor(player_node, _local_slot().cell, _player_step_time())
 
@@ -766,13 +967,11 @@ func _refresh() -> void:
 	best_label.text = "BEST  %d" % maxi(high_score, shown_slot.score)
 	if audio and audio.muted:
 		best_label.text += "   MUTED"
-	# The rival panel drops in above the controls, so the controls move down.
-	rival_label.visible = match_state != null
-	status_label.position.y = 348.0 if match_state != null else 252.0
+	# The field of players drops in above the controls, so the controls move down.
+	roster_label.visible = match_state != null
+	status_label.position.y = 392.0 if match_state != null else 252.0
 	if match_state != null:
-		var rival: PlayerSlot = match_state.players[1 - local_player]
-		var where := "HIER!" if match_state.world_of_player[1 - local_player] == shown_world else "DRUEBEN"
-		rival_label.text = "GEGNER\nSCORE  %d\nLEBEN  %d\n%s" % [rival.score, rival.lives, where]
+		roster_label.text = _roster_panel_text()
 	match state.phase:
 		GameStateClass.Phase.READY:
 			status_label.text = "PRESS A DIRECTION\nTO START\n\nWASD / ARROWS\nor drag to tilt"
@@ -787,10 +986,43 @@ func _refresh() -> void:
 			var level_line := "LEVEL %d" % (state.level_index + 1)
 			if LevelDataClass.is_endless(state.level_index):
 				level_line += "  ENDLESS"
-			if match_state != null:
-				status_label.text = "%s\n\nF  KAFFEE\nWERFEN\n\nESC  ENDE" % level_line
+			if match_state != null and match_state.players[local_player].is_out:
+				status_label.text = "KNOCKED OUT\n\nWatching the\nothers race.\n\nESC  QUIT"
+			elif match_state != null:
+				status_label.text = "%s\n\nF  THROW\nCOFFEE\n\nESC  QUIT" % level_line
 			else:
 				status_label.text = "%s\nSPEED %.1f\n\nWASD / ARROWS\nDrag mouse to tilt\n\nP pause  R restart" % [level_line, LevelDataClass.speed(state.level_index)]
+
+
+# Two lines per player - name, then standing - each in that player's own colour,
+# the one their figure wears on the board.
+func _roster_panel_text() -> String:
+	var lines := ""
+	for player_index in range(match_state.player_count()):
+		var slot: PlayerSlot = match_state.players[player_index]
+		var standing := "away"
+		if slot.is_out:
+			standing = "out"
+		elif player_index == local_player:
+			standing = "YOU"
+		elif match_state.world_of_player[player_index] == shown_world:
+			standing = "HERE!"
+		lines += "[color=#%s]%s[/color]\n  %d  L%d  %s\n" % [
+			_player_tint(player_index).to_html(false), _player_name(player_index),
+			slot.score, slot.lives, standing,
+		]
+	return lines
+
+
+func _player_tint(player_index: int) -> Color:
+	return PLAYER_TINTS[player_index % PLAYER_TINTS.size()]
+
+
+# The local hero wears its slot colour in a match, so the panel can name it.
+func _local_tint() -> Color:
+	if match_state == null:
+		return Color.WHITE
+	return _player_tint(local_player)
 
 
 func _update_level_background() -> void:
@@ -859,7 +1091,7 @@ func _reset_level_view() -> void:
 		player_node.rotation = 0.0
 	player_hit_until = 0.0
 	move_cooldown = 0.0
-	remote_move_cooldown = 0.0
+	remote_move_cooldown.fill(0.0)
 	enemy_cooldown = _enemy_step_time()
 	teapot_cooldown = _enemy_step_time_for_kind(&"teapot")
 	ultra_cooldown = _enemy_step_time_for_kind(&"ultra")
@@ -936,14 +1168,39 @@ func _set_hero_frame(hero: Node2D, facing: Vector2i, walk_frame := 0) -> void:
 		row = 2
 	var frame := Vector2i(clampi(walk_frame, 0, 3), row)
 	var region := Rect2(Vector2(frame) * frame_size, frame_size)
-	for sprite in hero.get_children():
-		if sprite is Sprite2D:
-			sprite.region_rect = region
-			sprite.flip_h = facing == Vector2i.RIGHT
+	_set_hero_texture(hero, texture, region, facing == Vector2i.RIGHT)
+
+
+func _set_hero_action_frame(hero: Node2D, texture_path: String, facing: Vector2i, action_frame: int) -> void:
+	var texture: Texture2D = load(texture_path)
+	var frame_size := texture.get_size() / 4.0
+	var row := 0
+	if facing == Vector2i.UP:
+		row = 1
+	elif facing == Vector2i.LEFT:
+		row = 2
+	elif facing == Vector2i.RIGHT:
+		row = 3
+	var frame := Vector2i(clampi(action_frame, 0, 3), row)
+	_set_hero_texture(hero, texture, Rect2(Vector2(frame) * frame_size, frame_size), false)
+
+
+func _set_hero_texture(hero: Node2D, texture: Texture2D, region: Rect2, flip_h: bool) -> void:
+	var scale_factor := 52.0 / maxf(region.size.x, region.size.y)
+	for child in hero.get_children():
+		if child is Sprite2D:
+			child.texture = texture
+			child.region_rect = region
+			child.scale = Vector2.ONE * scale_factor
+			child.flip_h = flip_h
 
 
 func _animate_player() -> void:
 	if not is_instance_valid(player_node) or not player_node.visible:
+		return
+	if _set_coffee_action_frame(player_node, local_player):
+		player_node.scale = Vector2.ONE
+		player_node.rotation = 0.0
 		return
 	var moving := _actor_is_moving(player_node)
 	if moving:
@@ -958,6 +1215,22 @@ func _animate_player() -> void:
 		var breath := sin(elapsed * 3.2) * 0.012
 		player_node.scale = Vector2(1.0 - breath * 0.5, 1.0 + breath)
 		player_node.rotation = 0.0
+
+
+func _set_coffee_action_frame(hero: Node2D, player_index: int) -> bool:
+	if match_state == null or player_index < 0 or player_index >= match_state.player_count():
+		return false
+	var slot: PlayerSlot = match_state.players[player_index]
+	var throw_left := float(coffee_throw_until.get(player_index, 0.0)) - elapsed
+	if throw_left > 0.0:
+		var progress := 1.0 - throw_left / COFFEE_THROW_TIME
+		_set_hero_action_frame(hero, HERO_COFFEE_THROW_TEXTURE, slot.facing, mini(int(progress * 4.0), 3))
+		return true
+	var ratio := match_state.charge_ratio(player_index)
+	if ratio <= 0.01:
+		return false
+	_set_hero_action_frame(hero, HERO_COFFEE_CHARGE_TEXTURE, slot.facing, mini(int(ratio * 4.0), 3))
+	return true
 
 
 func _actor_is_moving(actor: Node2D) -> bool:
@@ -1080,8 +1353,21 @@ func _cell_position(cell: Vector2i) -> Vector2:
 	return BOARD_ORIGIN + (Vector2(cell) + Vector2(0.5, 0.5)) * TILE
 
 
-func _on_game_event(kind: StringName, cell: Vector2i, _player_index: int) -> void:
-	if kind == &"life_lost":
+func _on_game_event(kind: StringName, cell: Vector2i, player_index: int) -> void:
+	if kind == &"coffee_thrown":
+		coffee_throw_until[player_index] = elapsed + COFFEE_THROW_TIME
+		_play_coffee_throw(cell, player_index)
+	elif kind == &"coffee_hit":
+		_spawn_impact_specks(cell, Color("8b5a2b"))
+		_shake(3.0)
+	elif kind == &"life_lost":
+		# A rival being filtered out on your board is their business: no ghost of
+		# your own hero, no shake, and above all none of the freeze that a death
+		# puts on your own steps.
+		if match_state != null and player_index != local_player:
+			_spawn_impact_specks(cell, Color("ff8a5c"))
+			audio.play(&"life_lost", 0.85)
+			return
 		snap_next_refresh = true
 		player_hit_until = elapsed + 0.7
 		_play_player_hit(cell)
@@ -1136,7 +1422,10 @@ func _on_game_event(kind: StringName, cell: Vector2i, _player_index: int) -> voi
 		_pop_score(cell, 0, Color("9ed6f0"), "GROUND SHIFTS")
 	elif kind == &"game_over":
 		audio.play(&"life_lost", 0.72)
-		_show_game_over(_record_run())
+		# A match settles itself through MatchState, and one player being knocked
+		# out neither ends the race nor belongs in the single-player table.
+		if match_state == null:
+			_show_game_over(_record_run())
 
 
 func _pop_score(cell: Vector2i, points: int, color: Color, text := "") -> void:
@@ -1151,13 +1440,39 @@ func _pop_score(cell: Vector2i, points: int, color: Color, text := "") -> void:
 	popup_tween.chain().tween_callback(popup.queue_free)
 
 
+func _play_coffee_throw(cell: Vector2i, player_index: int) -> void:
+	if match_state == null or player_index < 0 or player_index >= match_state.player_count():
+		return
+	var slot: PlayerSlot = match_state.players[player_index]
+	var facing := slot.facing
+	var landing := cell
+	for step in range(MatchStateClass.THROW_RANGE):
+		var next := landing + facing
+		if not state.is_inside(next) or state.get_cell(next) == GameStateClass.Cell.SOIL:
+			break
+		landing = next
+	var texture: Texture2D = load(HERO_COFFEE_THROW_TEXTURE)
+	# The release frame contains a detached mug on transparent pixels. Cropping it
+	# here keeps the generated cup art while avoiding another runtime sheet.
+	var cup := _art_node(texture, 21.0, Rect2(785, 198, 105, 92))
+	cup.position = _cell_position(cell) + Vector2(facing) * 14.0
+	cup.z_index = 8
+	actors.add_child(cup)
+	var flight := create_tween()
+	flight.set_parallel(true)
+	flight.tween_property(cup, "position", _cell_position(landing), COFFEE_THROW_TIME).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+	flight.tween_property(cup, "rotation", TAU * 0.8, COFFEE_THROW_TIME)
+	flight.tween_property(cup, "scale", Vector2(0.82, 0.82), COFFEE_THROW_TIME)
+	flight.chain().tween_callback(cup.queue_free)
+
+
 # Grazing an enemy is survivable, so it gets a warning flash instead of a death.
 func _play_close_call(cell: Vector2i) -> void:
 	_spawn_impact_specks(cell, Color("ffd27a"))
 	if is_instance_valid(player_node):
 		var graze_tween := create_tween()
 		graze_tween.tween_property(player_node, "modulate", Color("ffd27a"), 0.08)
-		graze_tween.tween_property(player_node, "modulate", Color.WHITE, 0.2)
+		graze_tween.tween_property(player_node, "modulate", _local_tint(), 0.2)
 
 
 func _play_player_hit(cell: Vector2i) -> void:
@@ -1179,7 +1494,7 @@ func _play_player_hit(cell: Vector2i) -> void:
 	var reveal_tween := create_tween()
 	reveal_tween.tween_interval(0.7)
 	reveal_tween.tween_callback(func() -> void:
-		if is_instance_valid(player_node) and state.phase != GameStateClass.Phase.GAME_OVER:
+		if is_instance_valid(player_node) and state.phase != GameStateClass.Phase.GAME_OVER and not _local_slot().is_out:
 			player_node.visible = true
 	)
 
@@ -1286,46 +1601,37 @@ func _build_charge_ring() -> Line2D:
 
 
 func _update_charge_ring() -> void:
-	if match_state == null or not is_instance_valid(player_node) or not player_node.visible:
-		charge_ring.visible = false
-		return
-	var ratio := match_state.charge_ratio(local_player)
-	charge_ring.visible = ratio > 0.01
-	if not charge_ring.visible:
-		return
-	var points := PackedVector2Array()
-	var steps := maxi(int(ratio * 24.0), 1)
-	for step in range(steps + 1):
-		var angle := -PI * 0.5 + TAU * ratio * float(step) / float(steps)
-		points.append(Vector2(cos(angle), sin(angle)) * 26.0)
-	charge_ring.points = points
-	charge_ring.position = player_node.position
-	var armed := match_state.is_armed(local_player)
-	charge_ring.default_color = Color("9ef0a0") if armed else Color("c9a227")
-	charge_ring.width = 5.0 if armed else 3.0
-	if armed:
-		charge_ring.modulate = Color(1, 1, 1, 0.65 + 0.35 * absf(sin(elapsed * 6.0)))
-	else:
-		charge_ring.modulate = Color.WHITE
+	# Kept as a fallback node, but the quieter pouring pose is the default.
+	charge_ring.visible = false
 
 
-# The rival only exists on screen while standing on the board being drawn.
-func _update_rival_node() -> void:
+# A rival only exists on screen while standing on the board being drawn. The list
+# is indexed by player, so the slot belonging to the local hero simply stays
+# hidden.
+func _update_rival_nodes() -> void:
 	if match_state == null:
-		if is_instance_valid(rival_node):
-			rival_node.visible = false
+		for node in rival_nodes:
+			if is_instance_valid(node):
+				node.visible = false
 		return
-	var rival: PlayerSlot = match_state.players[1 - local_player]
-	var here := match_state.world_of_player[1 - local_player] == shown_world
-	if not is_instance_valid(rival_node):
-		rival_node = _hero_node()
-		rival_node.modulate = RIVAL_TINT
-		actors.add_child(rival_node)
-	rival_node.visible = here
-	if not here:
-		return
-	_set_hero_frame(rival_node, rival.facing)
-	_move_actor(rival_node, rival.cell, _player_step_time())
+	while rival_nodes.size() < match_state.player_count():
+		var hero := _hero_node()
+		hero.modulate = _player_tint(rival_nodes.size())
+		hero.visible = false
+		actors.add_child(hero)
+		rival_nodes.append(hero)
+	for player_index in range(match_state.player_count()):
+		var node: Node2D = rival_nodes[player_index]
+		if not is_instance_valid(node):
+			continue
+		var rival: PlayerSlot = match_state.players[player_index]
+		var here := not rival.is_out and match_state.world_of_player[player_index] == shown_world
+		node.visible = here and player_index != local_player
+		if not node.visible:
+			continue
+		if not _set_coffee_action_frame(node, player_index):
+			_set_hero_frame(node, rival.facing)
+		_move_actor(node, rival.cell, _player_step_time())
 
 
 func _build_shield() -> Line2D:
@@ -1352,13 +1658,13 @@ func _animate_invulnerability() -> void:
 		var left := state.invulnerability_left(_local_board_index())
 		var urgency := 1.0 - clampf(left / GameStateClass.RESPAWN_INVULNERABILITY, 0.0, 1.0)
 		var blink := sin(elapsed * (15.0 + urgency * 30.0))
-		player_node.modulate = Color("ffe6a8") if blink > 0.0 else Color(1, 1, 1, 0.2)
+		player_node.modulate = Color("ffe6a8") if blink > 0.0 else Color(_local_tint(), 0.2)
 		shield_node.position = player_node.position
 		var pulse := 1.0 + sin(elapsed * 7.0) * 0.09
 		shield_node.scale = Vector2.ONE * pulse
 		shield_node.modulate = Color(1, 1, 1, 0.35 + 0.45 * absf(blink))
 	elif was_invulnerable:
-		player_node.modulate = Color.WHITE
+		player_node.modulate = _local_tint()
 	was_invulnerable = invulnerable
 
 
@@ -1442,7 +1748,8 @@ func _process_match(delta: float, direction: Vector2i, throw_pressed: bool) -> v
 		world.tick_contacts()
 
 	move_cooldown -= delta
-	remote_move_cooldown -= delta
+	for player_index in range(remote_move_cooldown.size()):
+		remote_move_cooldown[player_index] -= delta
 	enemy_cooldown -= delta
 	teapot_cooldown -= delta
 	ultra_cooldown -= delta
@@ -1457,16 +1764,18 @@ func _process_match(delta: float, direction: Vector2i, throw_pressed: bool) -> v
 		else:
 			move_cooldown = 0.0
 
-	# The guest walks on the same clock as the host, just from stored intent.
-	var remote_player := 1 - local_player
-	if remote_throw:
-		remote_throw = false
-		match_state.throw_coffee(remote_player)
-	if remote_move_cooldown <= 0.0:
-		if match_state.move_player(remote_player, remote_direction):
-			remote_move_cooldown += _player_step_time()
-		else:
-			remote_move_cooldown = 0.0
+	# Every guest walks on the same clock as the host, just from stored intent.
+	for player_index in range(match_state.player_count()):
+		if player_index == local_player:
+			continue
+		if remote_throw[player_index]:
+			remote_throw[player_index] = false
+			match_state.throw_coffee(player_index)
+		if remote_move_cooldown[player_index] <= 0.0:
+			if match_state.move_player(player_index, remote_direction[player_index]):
+				remote_move_cooldown[player_index] += _player_step_time()
+			else:
+				remote_move_cooldown[player_index] = 0.0
 
 	# Both plantations keep running, so a raider cannot freeze the board they left.
 	if enemy_cooldown <= 0.0:
@@ -1493,4 +1802,4 @@ func _process_match(delta: float, direction: Vector2i, throw_pressed: bool) -> v
 	snapshot_countdown -= delta
 	if snapshot_countdown <= 0.0:
 		snapshot_countdown += SNAPSHOT_INTERVAL
-		net.broadcast_snapshot(match_state.to_bytes())
+		_send_snapshots()

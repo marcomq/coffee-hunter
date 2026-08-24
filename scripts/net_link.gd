@@ -10,16 +10,20 @@ extends Node
 # it already carries Tailscale/ZeroTier addresses and 127.0.0.1 today.
 
 signal lobby_changed
+signal roster_changed
 signal link_ready(player_index: int)
 signal link_lost(reason: String)
+signal player_left(player_index: int)
 signal input_received(player_index: int, direction: Vector2i, throw_pressed: bool)
 signal snapshot_received(payload: PackedByteArray)
 signal event_received(kind: StringName, cell: Vector2i, world_index: int, player_index: int)
-signal match_started(seed_value: int)
-signal rematch_requested
+signal match_started(seed_value: int, player_count: int)
+signal rematch_requested(player_index: int)
+signal rematch_changed(flags: PackedByteArray)
 
 enum Role { OFFLINE, HOST, CLIENT }
 
+const MAX_PLAYERS := 4
 const GAME_PORT := 44567
 const DISCOVERY_PORT := 44568
 const BEACON_INTERVAL := 1.0
@@ -30,12 +34,21 @@ const BEACON_TAG := "coffee-hunter-v1"
 var role := Role.OFFLINE
 var found_games: Array[Dictionary] = []
 var status_text := ""
+# Who is in this match: [{peer_id, index, name}, ...]. The host keeps the list and
+# hands out the slots; everyone else mirrors whatever the host last sent.
+var roster: Array[Dictionary] = []
+# Shut while a race is on: a latecomer would sit in the waiting room holding up
+# the rematch, since that waits for every seat in the roster.
+var accepting := true
 
 var _beacon := PacketPeerUDP.new()
 var _browser := PacketPeerUDP.new()
 var _beacon_countdown := 0.0
 var _browsing := false
-var _host_name := "Plantage"
+var _host_name := "Plantation"
+var _local_name := "PAOLO"
+# The slot this peer last knew as its own; a rematch can renumber it.
+var _seated_index := -1
 var _closing := false
 
 
@@ -50,34 +63,43 @@ func _ready() -> void:
 # --- discovery ---------------------------------------------------------------
 
 
-func host(host_name := "Plantage") -> bool:
+func host(player_name := "PAOLO") -> bool:
 	_ensure_peer_closed()
 	var peer := ENetMultiplayerPeer.new()
-	var error := peer.create_server(GAME_PORT, 1)
+	var error := peer.create_server(GAME_PORT, MAX_PLAYERS - 1)
 	if error != OK:
-		status_text = "Port %d ist belegt" % GAME_PORT
+		status_text = "Port %d is taken" % GAME_PORT
 		return false
 	multiplayer.multiplayer_peer = peer
 	role = Role.HOST
-	_host_name = host_name
+	_seated_index = 0
+	_local_name = player_name
+	_host_name = player_name
+	roster = [{"peer_id": 1, "index": 0, "name": player_name}]
+	accepting = true
 	_beacon.set_broadcast_enabled(true)
 	_beacon.set_dest_address("255.255.255.255", DISCOVERY_PORT)
 	_beacon_countdown = 0.0
-	status_text = "Warte auf einen Gegenspieler..."
+	status_text = "Waiting for players..."
 	stop_browsing()
+	link_ready.emit(0)
+	roster_changed.emit()
 	return true
 
 
-func join(address: String) -> bool:
+func join(address: String, player_name := "PAOLO") -> bool:
 	_ensure_peer_closed()
 	var peer := ENetMultiplayerPeer.new()
 	var error := peer.create_client(address.strip_edges(), GAME_PORT)
 	if error != OK:
-		status_text = "Kann %s nicht erreichen" % address
+		status_text = "Cannot reach %s" % address
 		return false
 	multiplayer.multiplayer_peer = peer
 	role = Role.CLIENT
-	status_text = "Verbinde mit %s..." % address
+	_seated_index = -1
+	_local_name = player_name
+	roster.clear()
+	status_text = "Connecting to %s..." % address
 	stop_browsing()
 	return true
 
@@ -86,7 +108,7 @@ func start_browsing() -> void:
 	if _browsing:
 		return
 	if _browser.bind(DISCOVERY_PORT) != OK:
-		status_text = "Kann im LAN nicht suchen (Port %d belegt)" % DISCOVERY_PORT
+		status_text = "Cannot browse the LAN (port %d is taken)" % DISCOVERY_PORT
 		return
 	_browsing = true
 	found_games.clear()
@@ -109,6 +131,8 @@ func disconnect_link(reason := "") -> void:
 		return
 	_closing = true
 	role = Role.OFFLINE
+	_seated_index = -1
+	roster.clear()
 	stop_browsing()
 	_beacon.close()
 	_close_peer.call_deferred()
@@ -148,6 +172,7 @@ func _process(delta: float) -> void:
 				"tag": BEACON_TAG,
 				"name": _host_name,
 				"port": GAME_PORT,
+				"players": roster.size(),
 			}))
 	if _browsing:
 		_poll_browser()
@@ -160,18 +185,19 @@ func _poll_browser() -> void:
 		var beacon: Variant = bytes_to_var(payload)
 		if not (beacon is Dictionary) or beacon.get("tag", "") != BEACON_TAG:
 			continue
-		_remember_host(sender, String(beacon.get("name", "Plantage")))
+		_remember_host(sender, String(beacon.get("name", "Plantation")), int(beacon.get("players", 1)))
 	_forget_stale_hosts()
 
 
-func _remember_host(address: String, host_name: String) -> void:
+func _remember_host(address: String, host_name: String, player_count: int) -> void:
 	var now := Time.get_ticks_msec() / 1000.0
 	for entry in found_games:
 		if entry["address"] == address:
 			entry["last_seen"] = now
 			entry["name"] = host_name
+			entry["players"] = player_count
 			return
-	found_games.append({"address": address, "name": host_name, "last_seen": now})
+	found_games.append({"address": address, "name": host_name, "players": player_count, "last_seen": now})
 	lobby_changed.emit()
 
 
@@ -199,9 +225,72 @@ func is_online() -> bool:
 	return role != Role.OFFLINE
 
 
-# Host owns player 0, the single guest owns player 1.
+# The host always owns slot 0; every guest is told its slot with the roster.
 func local_player_index() -> int:
-	return 0 if role == Role.HOST else 1
+	if role == Role.HOST:
+		return 0
+	# No peer, no seat: a guest has no slot until the host's roster hands it one.
+	if multiplayer == null or multiplayer.multiplayer_peer == null:
+		return -1
+	return index_of_peer(multiplayer.get_unique_id())
+
+
+func index_of_peer(peer_id: int) -> int:
+	for entry in roster:
+		if int(entry["peer_id"]) == peer_id:
+			return int(entry["index"])
+	return -1
+
+
+func name_of(player_index: int) -> String:
+	for entry in roster:
+		if int(entry["index"]) == player_index:
+			return String(entry["name"])
+	return "PLAYER %d" % (player_index + 1)
+
+
+# Everyone but the host, for the per-peer snapshot loop.
+func guests() -> Array[Dictionary]:
+	var others: Array[Dictionary] = []
+	for entry in roster:
+		if int(entry["peer_id"]) != 1:
+			others.append(entry)
+	return others
+
+
+# The lowest free slot, so a seat left by a quitter is filled again.
+func _claim_slot(peer_id: int, player_name: String) -> int:
+	for entry in roster:
+		if int(entry["peer_id"]) == peer_id:
+			return int(entry["index"])
+	var taken: Array[int] = []
+	for entry in roster:
+		taken.append(int(entry["index"]))
+	for candidate in range(MAX_PLAYERS):
+		if not taken.has(candidate):
+			roster.append({"peer_id": peer_id, "index": candidate, "name": player_name})
+			roster.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return int(a["index"]) < int(b["index"]))
+			return candidate
+	return -1
+
+
+# Seats left empty by a quitter are closed up before the next race, so the match
+# above can keep counting its players 0..n-1.
+func compact_slots() -> void:
+	if role != Role.HOST:
+		return
+	roster.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return int(a["index"]) < int(b["index"]))
+	for position in range(roster.size()):
+		roster[position]["index"] = position
+	push_roster.rpc(_packed_roster())
+	roster_changed.emit()
+
+
+func _packed_roster() -> Array:
+	var packed: Array = []
+	for entry in roster:
+		packed.append([int(entry["peer_id"]), int(entry["index"]), String(entry["name"])])
+	return packed
 
 
 # Deliberately quiet: a peer that has just connected is not yet able to receive
@@ -209,30 +298,40 @@ func local_player_index() -> int:
 # is the first moment a broadcast is guaranteed to land.
 func _on_peer_connected(_peer_id: int) -> void:
 	if role == Role.HOST:
-		status_text = "Gegenspieler verbindet sich..."
+		status_text = "A player is connecting..."
 
 
-# Fires on both sides, so the wording has to follow the role: for the host a
-# guest walked out, for the guest the host closed the plantation.
-func _on_peer_disconnected(_peer_id: int) -> void:
-	if role == Role.CLIENT:
-		disconnect_link("Der Host hat das Spiel beendet")
-	else:
-		disconnect_link("Der Gegenspieler hat die Verbindung verlassen")
+# With server relay on, a client also hears about every other client leaving, so
+# only the host acts on this: a guest learns who is gone from the next roster.
+# The one departure that ends a guest's match is the host's, and that arrives as
+# `server_disconnected`.
+func _on_peer_disconnected(peer_id: int) -> void:
+	if role != Role.HOST:
+		return
+	var index := index_of_peer(peer_id)
+	if index < 0:
+		return
+	for entry_index in range(roster.size()):
+		if int(roster[entry_index]["peer_id"]) == peer_id:
+			roster.remove_at(entry_index)
+			break
+	status_text = "%s left the plantation" % name_of(index)
+	push_roster.rpc(_packed_roster())
+	player_left.emit(index)
+	roster_changed.emit()
 
 
 func _on_connected_to_server() -> void:
-	status_text = "Verbunden"
-	announce_ready.rpc_id(1)
-	link_ready.emit(1)
+	status_text = "Connected - waiting for a slot"
+	announce_ready.rpc_id(1, _local_name)
 
 
 func _on_connection_failed() -> void:
-	disconnect_link("Verbindung fehlgeschlagen")
+	disconnect_link("Connection failed")
 
 
 func _on_server_disconnected() -> void:
-	disconnect_link("Der Host hat das Spiel beendet")
+	disconnect_link("The host closed the game")
 
 
 func send_input(direction: Vector2i, throw_pressed: bool) -> void:
@@ -241,10 +340,12 @@ func send_input(direction: Vector2i, throw_pressed: bool) -> void:
 	submit_input.rpc_id(1, direction, throw_pressed)
 
 
-func broadcast_snapshot(payload: PackedByteArray) -> void:
+# One board per guest, never the whole match: see the note above
+# `MatchState.to_bytes`.
+func send_snapshot(peer_id: int, payload: PackedByteArray) -> void:
 	if role != Role.HOST:
 		return
-	push_snapshot.rpc(payload)
+	push_snapshot.rpc_id(peer_id, payload)
 
 
 func broadcast_event(kind: StringName, cell: Vector2i, world_index: int, player_index: int) -> void:
@@ -253,39 +354,87 @@ func broadcast_event(kind: StringName, cell: Vector2i, world_index: int, player_
 	push_event.rpc(kind, cell, world_index, player_index)
 
 
-func broadcast_match_start(seed_value: int) -> void:
+func broadcast_match_start(seed_value: int, player_count: int) -> void:
 	if role != Role.HOST:
 		return
-	push_match_start.rpc(seed_value)
+	push_match_start.rpc(seed_value, player_count)
 
 
-# A rematch takes both sides, so this only announces intent - it travels either
-# way and the receiver decides what it is worth. Only the host owns the seed and
-# can actually start the next race.
+# A rematch takes everyone, so a guest can only announce itself; the host keeps
+# the tally and owns the seed for the next race.
 func send_rematch() -> void:
-	if role == Role.OFFLINE:
+	if role != Role.CLIENT:
 		return
-	request_rematch.rpc()
+	request_rematch.rpc_id(1)
+
+
+func broadcast_rematch(flags: PackedByteArray) -> void:
+	if role != Role.HOST:
+		return
+	push_rematch.rpc(flags)
 
 
 @rpc("any_peer", "call_remote", "reliable")
 func request_rematch() -> void:
-	rematch_requested.emit()
+	if role != Role.HOST:
+		return
+	rematch_requested.emit(index_of_peer(multiplayer.get_remote_sender_id()))
+
+
+@rpc("authority", "call_remote", "reliable")
+func push_rematch(flags: PackedByteArray) -> void:
+	rematch_changed.emit(flags)
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func announce_ready() -> void:
+func announce_ready(player_name: String) -> void:
 	if role != Role.HOST:
 		return
-	status_text = "Gegenspieler verbunden"
-	link_ready.emit(0)
+	var peer_id := multiplayer.get_remote_sender_id()
+	if not accepting:
+		push_rejected.rpc_id(peer_id, "The race is already running - try again shortly")
+		return
+	var index := _claim_slot(peer_id, player_name)
+	if index < 0:
+		status_text = "The plantation is full"
+		push_rejected.rpc_id(peer_id, "The plantation is full")
+		return
+	status_text = "%d players in the lobby" % roster.size()
+	push_roster.rpc(_packed_roster())
+	roster_changed.emit()
+
+
+# The guest tears its own link down, which is what tells the host to forget the
+# half-finished handshake.
+@rpc("authority", "call_remote", "reliable")
+func push_rejected(reason: String) -> void:
+	disconnect_link(reason)
+
+
+@rpc("authority", "call_remote", "reliable")
+func push_roster(entries: Array) -> void:
+	roster.clear()
+	for entry in entries:
+		roster.append({"peer_id": int(entry[0]), "index": int(entry[1]), "name": String(entry[2])})
+	var own_index := local_player_index()
+	# The roster that first names this peer is also the moment it learns which
+	# plantation is its own - there is no earlier one. A rematch that closes up
+	# empty seats moves it again, and that has to travel too.
+	if own_index >= 0 and own_index != _seated_index:
+		_seated_index = own_index
+		status_text = "Connected as %s" % name_of(own_index)
+		link_ready.emit(own_index)
+	roster_changed.emit()
 
 
 @rpc("any_peer", "call_remote", "unreliable_ordered")
 func submit_input(direction: Vector2i, throw_pressed: bool) -> void:
 	if role != Role.HOST:
 		return
-	input_received.emit(1, direction, throw_pressed)
+	var index := index_of_peer(multiplayer.get_remote_sender_id())
+	if index < 0:
+		return
+	input_received.emit(index, direction, throw_pressed)
 
 
 @rpc("authority", "call_remote", "unreliable")
@@ -299,5 +448,5 @@ func push_event(kind: StringName, cell: Vector2i, world_index: int, player_index
 
 
 @rpc("authority", "call_remote", "reliable")
-func push_match_start(seed_value: int) -> void:
-	match_started.emit(seed_value)
+func push_match_start(seed_value: int, player_count: int) -> void:
+	match_started.emit(seed_value, player_count)
