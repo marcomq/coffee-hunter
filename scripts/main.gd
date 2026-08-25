@@ -55,6 +55,8 @@ const ENEMY_TEXTURES := {
 	&"ultra": "res://assets/art/source/ultra-chimp-sheet-v1.png",
 }
 const ENEMY_SIZES := {&"teapod": 44.0, &"teapot": 50.0, &"ultra": 56.0}
+const ENEMY_WALK_FRAMES := [Vector2i.ZERO, Vector2i(1, 0), Vector2i(0, 1), Vector2i(1, 0)]
+const TEAPOD_WALK_FRAMES := [Vector2i.ZERO, Vector2i(1, 0), Vector2i(0, 1), Vector2i(1, 1)]
 const LEVEL_BACKGROUNDS := [
 	"res://assets/art/source/level-tropical-background.png",
 	"res://assets/art/source/level-canyon-background-v1.png",
@@ -129,6 +131,7 @@ var net: NetLink
 var local_player := 0
 var rival_nodes: Array[Node2D] = []
 var charge_ring: Line2D
+var texture_cache: Dictionary[String, Texture2D] = {}
 var coffee_cup: Node2D
 var coffee_throw_until: Dictionary[int, float] = {}
 var shown_world := -1
@@ -1135,17 +1138,29 @@ func _reset_level_view() -> void:
 	_refresh()
 
 
+# Sheets are swapped every frame - the walk cycle, and one enemy frame per pod -
+# so going through ResourceLoader at that rate is pure overhead. Each sheet is
+# looked up once and kept for the run.
+func _texture(path: String) -> Texture2D:
+	if texture_cache.has(path):
+		return texture_cache[path]
+	var texture: Texture2D = load(path)
+	if texture != null:
+		texture_cache[path] = texture
+	return texture
+
+
 func _hero_node() -> Node2D:
-	var texture: Texture2D = load(HERO_TEXTURE)
+	var texture: Texture2D = _texture(HERO_TEXTURE)
 	var frame_size := texture.get_size() / 4.0
 	return _art_node(texture, 52.0, Rect2(Vector2.ZERO, frame_size))
 
 
 func _enemy_node(kind: StringName) -> Node2D:
-	var texture: Texture2D = load(ENEMY_TEXTURES[kind])
+	var texture: Texture2D = _texture(ENEMY_TEXTURES[kind])
 	if not texture and kind == &"teapod":
 		push_warning("Tea-pod walk sheet could not be loaded; using the previous sprite sheet")
-		texture = load(TEAPOD_FALLBACK_TEXTURE)
+		texture = _texture(TEAPOD_FALLBACK_TEXTURE)
 	if not texture:
 		push_error("Enemy texture could not be loaded for %s" % kind)
 		return Node2D.new()
@@ -1165,11 +1180,9 @@ func _bean_variant(value: Variant) -> int:
 
 func _update_enemy_frame(enemy_node: Node2D, enemy_index: int) -> void:
 	var kind: StringName = enemy_node.get_meta(&"enemy_kind", &"teapod")
-	var texture: Texture2D = load(ENEMY_TEXTURES[kind])
+	var texture: Texture2D = _texture(ENEMY_TEXTURES[kind])
 	var frame_size := texture.get_size() / 2.0
-	var frames := [Vector2i.ZERO, Vector2i(1, 0), Vector2i(0, 1), Vector2i(1, 0)]
-	if kind == &"teapod":
-		frames = [Vector2i.ZERO, Vector2i(1, 0), Vector2i(0, 1), Vector2i(1, 1)]
+	var frames: Array = TEAPOD_WALK_FRAMES if kind == &"teapod" else ENEMY_WALK_FRAMES
 	var frame := Vector2i.ZERO
 	var progress := _actor_move_progress(enemy_node)
 	if progress < 1.0:
@@ -1180,7 +1193,7 @@ func _update_enemy_frame(enemy_node: Node2D, enemy_index: int) -> void:
 func _set_enemy_frame(enemy_node: Node2D, frame: Vector2i, frame_size := Vector2.ZERO) -> void:
 	if frame_size == Vector2.ZERO:
 		var kind: StringName = enemy_node.get_meta(&"enemy_kind", &"teapod")
-		var texture: Texture2D = load(ENEMY_TEXTURES[kind])
+		var texture: Texture2D = _texture(ENEMY_TEXTURES[kind])
 		frame_size = texture.get_size() / 2.0
 	var region := Rect2(Vector2(frame) * frame_size, frame_size)
 	for sprite in enemy_node.get_children():
@@ -1199,7 +1212,7 @@ func _set_hero_frame(hero: Node2D, facing: Vector2i, walk_frame := 0) -> void:
 	elif facing == Vector2i.LEFT or facing == Vector2i.RIGHT:
 		row = 2
 	var region := _sheet_region(HERO_TEXTURE, clampi(walk_frame, 0, 3), row)
-	_set_hero_texture(hero, load(HERO_TEXTURE), region, facing == Vector2i.RIGHT)
+	_set_hero_texture(hero, _texture(HERO_TEXTURE), region, facing == Vector2i.RIGHT)
 
 
 func _sheet_region(texture_path: String, column: int, row: int) -> Rect2:
@@ -1217,7 +1230,7 @@ func _set_hero_action_frame(hero: Node2D, texture_path: String, facing: Vector2i
 		# otherwise the hero visibly swaps build the moment he pours or throws.
 		row = 2
 	var region := _sheet_region(texture_path, clampi(action_frame, 0, 3), row)
-	_set_hero_texture(hero, load(texture_path), region, facing == Vector2i.RIGHT)
+	_set_hero_texture(hero, _texture(texture_path), region, facing == Vector2i.RIGHT)
 
 
 func _set_hero_texture(hero: Node2D, texture: Texture2D, region: Rect2, flip_h: bool) -> void:
