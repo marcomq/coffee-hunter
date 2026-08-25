@@ -27,6 +27,9 @@ const MAX_PLAYERS := 4
 const GAME_PORT := 44567
 const DISCOVERY_PORT := 44568
 const BEACON_INTERVAL := 1.0
+# A second instance on this machine cannot take the discovery port while the
+# first one is browsing, so a failed bind is retried at this interval.
+const BIND_RETRY_INTERVAL := 1.0
 # A host that has gone quiet for this long drops off the browser.
 const BEACON_TIMEOUT := 4.0
 const BEACON_TAG := "coffee-hunter-v1"
@@ -45,6 +48,8 @@ var _beacon := PacketPeerUDP.new()
 var _browser := PacketPeerUDP.new()
 var _beacon_countdown := 0.0
 var _browsing := false
+var _browse_wanted := false
+var _bind_retry := 0.0
 var _host_name := "Plantation"
 var _local_name := "PAOLO"
 # The slot this peer last knew as its own; a rematch can renumber it.
@@ -105,17 +110,28 @@ func join(address: String, player_name := "PAOLO") -> bool:
 
 
 func start_browsing() -> void:
-	if _browsing:
-		return
-	if _browser.bind(DISCOVERY_PORT) != OK:
-		status_text = "Cannot browse the LAN (port %d is taken)" % DISCOVERY_PORT
-		return
-	_browsing = true
+	_browse_wanted = true
 	found_games.clear()
+	_bind_browser()
 	lobby_changed.emit()
 
 
+# The port is only ever held by another local instance sitting in its own lobby;
+# it frees the moment that instance hosts or leaves, so browsing is not given up
+# on a busy port - it is picked up on the next retry.
+func _bind_browser() -> bool:
+	if _browsing:
+		return true
+	_bind_retry = BIND_RETRY_INTERVAL
+	if _browser.bind(DISCOVERY_PORT) != OK:
+		status_text = "Port %d is busy - still looking for games" % DISCOVERY_PORT
+		return false
+	_browsing = true
+	return true
+
+
 func stop_browsing() -> void:
+	_browse_wanted = false
 	if not _browsing:
 		return
 	_browser.close()
@@ -174,6 +190,10 @@ func _process(delta: float) -> void:
 				"port": GAME_PORT,
 				"players": roster.size(),
 			}))
+	if _browse_wanted and not _browsing:
+		_bind_retry -= delta
+		if _bind_retry <= 0.0 and _bind_browser():
+			lobby_changed.emit()
 	if _browsing:
 		_poll_browser()
 

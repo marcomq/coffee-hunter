@@ -13,9 +13,33 @@ const BOARD_SIZE := Vector2(GameStateClass.WIDTH * TILE, GameStateClass.HEIGHT *
 const PLAYER_STEP_TIME := GameStateClass.PLAYER_STEP_TIME
 const ENEMY_STEP_TIME := GameStateClass.ENEMY_STEP_TIME
 const FILTER_STEP_TIME := GameStateClass.FILTER_STEP_TIME
+# A fall tween slightly outlives its tick, so consecutive rows blend into one
+# continuous drop instead of stalling once per cell.
+const FILTER_FALL_OVERLAP := 1.04
 const HERO_TEXTURE := "res://assets/art/source/hero-walk-sheet-v1.png"
 const HERO_COFFEE_CHARGE_TEXTURE := "res://assets/art/source/hero-coffee-charge-sheet-v1.png"
 const HERO_COFFEE_THROW_TEXTURE := "res://assets/art/source/hero-coffee-throw-sheet-v1.png"
+# The generated sheets are not laid out on an even 4x4 grid - the figures drift
+# from cell to cell - so slicing by size/4 drags the next row's hat into the
+# frame above it. Measured off the images by tools/measure_hero_frames.py.
+const HERO_SHEET_FRAMES := {
+	HERO_TEXTURE: {
+		"x": [36, 334, 638, 950], "width": 267,
+		"y": [23, 328, 617, 901], "heights": [271, 262, 262, 262],
+	},
+	HERO_COFFEE_CHARGE_TEXTURE: {
+		"x": [47, 337, 638, 938], "width": 254,
+		"y": [17, 324, 615, 903], "heights": [284, 274, 275, 279],
+	},
+	HERO_COFFEE_THROW_TEXTURE: {
+		"x": [0, 344, 689, 1033], "width": 345,
+		"y": [11, 309, 595, 857], "heights": [298, 276, 245, 252],
+	},
+}
+const COFFEE_CUP_TEXTURE := "res://assets/art/source/coffee-cup-flight-sheet-v1.png"
+# One upright mug lifted out of the flight sheet. The tumbling frames beside it
+# stay unused: a spin tween reads the same and costs no frame bookkeeping.
+const COFFEE_CUP_REGION := Rect2(1211, 186, 216, 183)
 const COFFEE_THROW_TIME := 0.24
 const TEAPOD_FALLBACK_TEXTURE := "res://assets/art/source/tea-filter-sheet-v2.png"
 const BEAN_TEXTURES := [
@@ -105,6 +129,7 @@ var net: NetLink
 var local_player := 0
 var rival_nodes: Array[Node2D] = []
 var charge_ring: Line2D
+var coffee_cup: Node2D
 var coffee_throw_until: Dictionary[int, float] = {}
 var shown_world := -1
 var snapshot_countdown := 0.0
@@ -140,6 +165,10 @@ func _ready() -> void:
 	actors.add_child(shield_node)
 	charge_ring = _build_charge_ring()
 	actors.add_child(charge_ring)
+	coffee_cup = _art_node(load(COFFEE_CUP_TEXTURE), 18.0, COFFEE_CUP_REGION)
+	coffee_cup.z_index = 9
+	coffee_cup.visible = false
+	actors.add_child(coffee_cup)
 	_build_overlay()
 	_build_net()
 	state.changed.connect(_refresh)
@@ -267,9 +296,11 @@ func _build_overlay() -> void:
 	lobby_address.text_submitted.connect(_on_address_submitted)
 	overlay.add_child(lobby_address)
 	# Never focused on its own: a focused field swallows every shortcut, which is
-	# exactly how the lobby once ate the H for hosting.
+	# exactly how the lobby once ate the H for hosting. It sits above the title,
+	# not below the body: that body grows with the high-score table, and its last
+	# line lands on y=490 once the table is full.
 	name_field = LineEdit.new()
-	name_field.position = Vector2(380, 490)
+	name_field.position = Vector2(380, 58)
 	name_field.size = Vector2(200, 34)
 	name_field.max_length = SaveDataClass.NAME_LENGTH
 	name_field.placeholder_text = "Your name"
@@ -278,7 +309,7 @@ func _build_overlay() -> void:
 	name_field.visible = false
 	name_field.text_submitted.connect(_on_name_submitted)
 	var name_hint := _label("YOUR NAME", 15, Color("9ec9d6"))
-	name_hint.position = Vector2(150, 496)
+	name_hint.position = Vector2(150, 64)
 	name_hint.size = Vector2(220, 24)
 	name_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	name_field.visibility_changed.connect(func() -> void: name_hint.visible = name_field.visible)
@@ -822,6 +853,7 @@ func _process(delta: float) -> void:
 	_animate_filters()
 	_update_rival_nodes()
 	_update_charge_ring()
+	_update_coffee_cup()
 	_animate_portal()
 	queue_redraw()
 
@@ -853,7 +885,10 @@ func _physics_process(delta: float) -> void:
 			queue_redraw()
 			return
 
+	if throw_pressed:
+		state.throw_coffee()
 	state.advance_time(delta)
+	state.tick_charge(delta)
 	state.tick_contacts()
 	move_cooldown -= delta
 	enemy_cooldown -= delta
@@ -952,11 +987,12 @@ func _refresh() -> void:
 	for filter_index in range(state.falling_filters.size()):
 		var filter_node := filter_nodes[filter_index]
 		var filter_cell := state.falling_filters[filter_index]
-		var filter_duration := _filter_step_time() * 0.72
+		var is_fall := true
 		if filter_node.has_meta(&"target_cell"):
 			var previous_cell: Vector2i = filter_node.get_meta(&"target_cell")
-			if previous_cell.y == filter_cell.y:
-				filter_duration = _player_step_time()
+			is_fall = previous_cell.y != filter_cell.y
+		filter_node.set_meta(&"falling_move", is_fall)
+		var filter_duration := _filter_step_time() * FILTER_FALL_OVERLAP if is_fall else _player_step_time()
 		_move_actor(filter_node, filter_cell, filter_duration)
 	snap_next_refresh = false
 
@@ -1157,36 +1193,37 @@ func _update_hero_frame() -> void:
 
 
 func _set_hero_frame(hero: Node2D, facing: Vector2i, walk_frame := 0) -> void:
-	var texture: Texture2D = load(HERO_TEXTURE)
-	var frame_size := texture.get_size() / 4.0
 	var row := 0
 	if facing == Vector2i.UP:
 		row = 1
-	elif facing == Vector2i.LEFT:
+	elif facing == Vector2i.LEFT or facing == Vector2i.RIGHT:
 		row = 2
-	elif facing == Vector2i.RIGHT:
-		row = 2
-	var frame := Vector2i(clampi(walk_frame, 0, 3), row)
-	var region := Rect2(Vector2(frame) * frame_size, frame_size)
-	_set_hero_texture(hero, texture, region, facing == Vector2i.RIGHT)
+	var region := _sheet_region(HERO_TEXTURE, clampi(walk_frame, 0, 3), row)
+	_set_hero_texture(hero, load(HERO_TEXTURE), region, facing == Vector2i.RIGHT)
+
+
+func _sheet_region(texture_path: String, column: int, row: int) -> Rect2:
+	var frames: Dictionary = HERO_SHEET_FRAMES[texture_path]
+	return Rect2(float(frames["x"][column]), float(frames["y"][row]), float(frames["width"]), float(frames["heights"][row]))
 
 
 func _set_hero_action_frame(hero: Node2D, texture_path: String, facing: Vector2i, action_frame: int) -> void:
-	var texture: Texture2D = load(texture_path)
-	var frame_size := texture.get_size() / 4.0
 	var row := 0
 	if facing == Vector2i.UP:
 		row = 1
-	elif facing == Vector2i.LEFT:
+	elif facing == Vector2i.LEFT or facing == Vector2i.RIGHT:
+		# The sheets draw a right-facing row of their own, but the walk cycle
+		# mirrors its left row instead. Doing the same here keeps one figure:
+		# otherwise the hero visibly swaps build the moment he pours or throws.
 		row = 2
-	elif facing == Vector2i.RIGHT:
-		row = 3
-	var frame := Vector2i(clampi(action_frame, 0, 3), row)
-	_set_hero_texture(hero, texture, Rect2(Vector2(frame) * frame_size, frame_size), false)
+	var region := _sheet_region(texture_path, clampi(action_frame, 0, 3), row)
+	_set_hero_texture(hero, load(texture_path), region, facing == Vector2i.RIGHT)
 
 
 func _set_hero_texture(hero: Node2D, texture: Texture2D, region: Rect2, flip_h: bool) -> void:
-	var scale_factor := 52.0 / maxf(region.size.x, region.size.y)
+	# Scaled off the nominal grid cell rather than the measured frame, so that
+	# tightening the rectangles does not silently resize the hero.
+	var scale_factor := 52.0 / (maxf(texture.get_size().x, texture.get_size().y) / 4.0)
 	for child in hero.get_children():
 		if child is Sprite2D:
 			child.texture = texture
@@ -1218,18 +1255,31 @@ func _animate_player() -> void:
 
 
 func _set_coffee_action_frame(hero: Node2D, player_index: int) -> bool:
-	if match_state == null or player_index < 0 or player_index >= match_state.player_count():
-		return false
-	var slot: PlayerSlot = match_state.players[player_index]
+	var slot: PlayerSlot
+	var ratio := 0.0
+	if match_state != null:
+		if player_index < 0 or player_index >= match_state.player_count():
+			return false
+		slot = match_state.players[player_index]
+		ratio = match_state.charge_ratio(player_index)
+	else:
+		if player_index != local_player:
+			return false
+		slot = _local_slot()
+		ratio = state.charge_ratio(_local_board_index())
 	var throw_left := float(coffee_throw_until.get(player_index, 0.0)) - elapsed
 	if throw_left > 0.0:
 		var progress := 1.0 - throw_left / COFFEE_THROW_TIME
 		_set_hero_action_frame(hero, HERO_COFFEE_THROW_TEXTURE, slot.facing, mini(int(progress * 4.0), 3))
 		return true
-	var ratio := match_state.charge_ratio(player_index)
-	if ratio <= 0.01:
+	# Walking wins over pouring: the hero keeps his stride, and the mug beside him
+	# is what says the brew is still running.
+	if _actor_is_moving(hero):
 		return false
-	_set_hero_action_frame(hero, HERO_COFFEE_CHARGE_TEXTURE, slot.facing, mini(int(ratio * 4.0), 3))
+	var pour := GameStateClass.pour_progress(ratio)
+	if pour <= 0.0:
+		return false
+	_set_hero_action_frame(hero, HERO_COFFEE_CHARGE_TEXTURE, slot.facing, mini(int(pour * 4.0), 3))
 	return true
 
 
@@ -1441,20 +1491,18 @@ func _pop_score(cell: Vector2i, points: int, color: Color, text := "") -> void:
 
 
 func _play_coffee_throw(cell: Vector2i, player_index: int) -> void:
-	if match_state == null or player_index < 0 or player_index >= match_state.player_count():
-		return
-	var slot: PlayerSlot = match_state.players[player_index]
-	var facing := slot.facing
+	var facing := _local_slot().facing
+	if match_state != null:
+		if player_index < 0 or player_index >= match_state.player_count():
+			return
+		facing = match_state.players[player_index].facing
 	var landing := cell
 	for step in range(MatchStateClass.THROW_RANGE):
 		var next := landing + facing
 		if not state.is_inside(next) or state.get_cell(next) == GameStateClass.Cell.SOIL:
 			break
 		landing = next
-	var texture: Texture2D = load(HERO_COFFEE_THROW_TEXTURE)
-	# The release frame contains a detached mug on transparent pixels. Cropping it
-	# here keeps the generated cup art while avoiding another runtime sheet.
-	var cup := _art_node(texture, 21.0, Rect2(785, 198, 105, 92))
+	var cup := _art_node(load(COFFEE_CUP_TEXTURE), 26.0, COFFEE_CUP_REGION)
 	cup.position = _cell_position(cell) + Vector2(facing) * 14.0
 	cup.z_index = 8
 	actors.add_child(cup)
@@ -1600,6 +1648,25 @@ func _build_charge_ring() -> Line2D:
 	return ring
 
 
+# The mug drawn into the hero sheet is a few pixels across, so the brew gets a
+# sprite of its own at hand height. While it fills it stays small and faint on
+# purpose: the jump to a solid, bobbing cup is what says the throw is ready.
+func _update_coffee_cup() -> void:
+	var ratio := match_state.charge_ratio(local_player) if match_state != null else state.charge_ratio(_local_board_index())
+	var pour := GameStateClass.pour_progress(ratio)
+	var throw_left := float(coffee_throw_until.get(local_player, 0.0)) - elapsed
+	coffee_cup.visible = pour > 0.0 and throw_left <= 0.0 and is_instance_valid(player_node) and player_node.visible
+	if not coffee_cup.visible:
+		return
+	var armed := ratio >= 1.0
+	# Held on the side the hero looks towards, so it never sits on top of his face.
+	var side := 13.0 if _local_slot().facing.x >= 0 else -13.0
+	var bob := sin(elapsed * (5.0 if armed else 2.4)) * (2.0 if armed else 0.6)
+	coffee_cup.position = player_node.position + Vector2(side, -4.5 + bob)
+	coffee_cup.scale = Vector2.ONE * ((1.0 + sin(elapsed * 6.0) * 0.08) if armed else (0.6 + pour * 0.25))
+	# coffee_cup.modulate = Color(1, 1, 1, 1.0 if armed else 0.18 + pour * 0.32)
+
+
 func _update_charge_ring() -> void:
 	# Kept as a fallback node, but the quieter pouring pose is the default.
 	charge_ring.visible = false
@@ -1680,16 +1747,23 @@ func _update_shake(delta: float) -> void:
 	board.position = Vector2(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0)) * shake_strength
 
 
-# A filter that will drop on the next tick shivers, so the hazard is readable.
+# A filter wobbles harder the closer its support is to giving way, so the drop is
+# telegraphed; on the way down it holds a steady stretch instead of shivering.
 func _animate_filters() -> void:
-	for filter_index in range(mini(filter_nodes.size(), state.falling_filter_states.size())):
+	for filter_index in range(mini(filter_nodes.size(), state.falling_filters.size())):
 		var filter_node := filter_nodes[filter_index]
-		if state.falling_filter_states[filter_index]:
-			filter_node.rotation = sin(elapsed * 44.0 + float(filter_index)) * 0.13
-			filter_node.scale = Vector2(1.07, 0.93)
-		else:
+		if filter_node.get_meta(&"falling_move", false) and _actor_is_moving(filter_node):
+			filter_node.rotation = 0.0
+			filter_node.scale = Vector2(0.93, 1.09)
+			continue
+		var pressure := state.filter_fall_pressure(filter_index)
+		if pressure <= 0.0:
 			filter_node.rotation = 0.0
 			filter_node.scale = Vector2.ONE
+			continue
+		var wobble := sin(elapsed * (16.0 + pressure * 30.0) + float(filter_index))
+		filter_node.rotation = wobble * 0.05 * (0.4 + pressure)
+		filter_node.scale = Vector2(1.0 + pressure * 0.06, 1.0 - pressure * 0.06)
 
 
 func _pop_in(node: Node2D) -> void:

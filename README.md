@@ -54,6 +54,11 @@ godot --path .
 
 Controls: WASD or arrow keys. Hold and drag the left mouse button to simulate device tilt. Press `R` to restart.
 
+Standing still for five seconds brews a coffee; `F` (or `Ctrl`) throws it. It
+flies two cells along your facing, stops at undug soil, and scalds the tea-pod it
+hits for the same 200 points a dropped filter pays. Walking spills a half-brewed
+mug, but a full one keeps until it is thrown.
+
 Type your name into the field at the bottom of the title screen. It is remembered
 between sessions, it labels you in a network race, and it is what stands next to
 your score in the high-score table — the five best single-player runs, shown on
@@ -70,11 +75,11 @@ plantation, and a full lap brings you home. Beans you pick while raiding count
 for *your* score, and a shoved coffee filter is as lethal to a player as it is to
 a tea-pod.
 
-Standing still for three seconds brews a coffee; `F` (or `Ctrl`) throws it, which
+Standing still for five seconds brews a coffee; `F` (or `Ctrl`) throws it, which
 the side panel spells out during a match. Walking spills a half-brewed mug, but a
 full one keeps until it is thrown. It flies two cells along your facing, stops at
 undug soil, and a hit takes half the rival's score and one life. A portal hop
-banks two of the three seconds, so raiding arrives nearly armed. Stolen points
+banks two thirds of the brew, so raiding arrives nearly armed. Stolen points
 never buy extra lives — only beans you picked yourself count toward those.
 
 The side panel lists every player in their own colour, the same colour their

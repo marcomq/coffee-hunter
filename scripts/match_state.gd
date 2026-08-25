@@ -15,10 +15,10 @@ signal event_emitted(kind: StringName, cell: Vector2i, world_index: int, player_
 signal finished(winner_index: int)
 
 const MAX_PLAYERS := 4
-const COFFEE_CHARGE_TIME := 3.0
-# A portal hop banks two of the three seconds, so raiding arrives nearly armed.
-const PORTAL_CHARGE_BONUS := 2.0
-const THROW_RANGE := 2
+const COFFEE_CHARGE_TIME := GameStateClass.COFFEE_CHARGE_TIME
+# A portal hop banks most of the brew, so raiding arrives nearly armed.
+const PORTAL_CHARGE_BONUS := COFFEE_CHARGE_TIME * 2.0 / 3.0
+const THROW_RANGE := GameStateClass.THROW_RANGE
 # Half, not all: a single throw should swing a match, not decide it outright.
 const THROW_STEAL_FRACTION := 0.5
 # The mug flies along the thrower's facing rather than hitting anyone within

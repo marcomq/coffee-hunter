@@ -60,7 +60,12 @@ func _init() -> void:
 	_test_win()
 	_test_both_worlds_share_a_layout()
 	_test_portal_moves_a_player_and_tops_up_the_charge()
-	_test_charge_fills_in_three_seconds_and_survives_a_step()
+	_test_pouring_starts_after_the_first_seconds()
+	_test_standing_still_brews_a_single_player_throw()
+	_test_single_player_throw_scalds_a_pod()
+	_test_single_player_throw_needs_a_full_charge()
+	_test_single_player_throw_range_and_walls()
+	_test_charge_fills_up_and_survives_a_step()
 	_test_throw_needs_a_full_charge()
 	_test_throw_only_reaches_two_cells_along_the_facing()
 	_test_throw_is_blocked_by_soil()
@@ -909,10 +914,82 @@ func _test_portal_moves_a_player_and_tops_up_the_charge() -> void:
 	_expect(match_state.world_of_player[0] == 1, "the portal drops the player on the other plantation")
 	_expect(match_state.worlds[1].players.has(slot), "the visiting slot joins the destination board")
 	_expect(not match_state.worlds[0].players.has(slot), "and leaves the board it came from")
-	_expect(is_equal_approx(slot.coffee_charge, MatchStateClass.PORTAL_CHARGE_BONUS), "a portal hop banks exactly two seconds of charge")
+	_expect(is_equal_approx(slot.coffee_charge, MatchStateClass.PORTAL_CHARGE_BONUS), "a portal hop banks most of a brew")
 
 
-func _test_charge_fills_in_three_seconds_and_survives_a_step() -> void:
+# The same mug, minus the rivals: outside a match the throw scalds a tea-pod.
+func _armed_solo(facing := Vector2i.RIGHT) -> GameState:
+	var game := _started_game()
+	game.player = Vector2i(4, game.corridor_y)
+	game.player_facing = facing
+	for step in range(GameStateClass.THROW_RANGE + 1):
+		game.set_cell(game.player + facing * step, GameStateClass.Cell.TUNNEL)
+	game.enemies = [game.player + facing * GameStateClass.THROW_RANGE]
+	game.enemy_alive = [true]
+	game.enemy_spawn_ticks = [0]
+	game.players[0].coffee_charge = GameStateClass.COFFEE_CHARGE_TIME
+	return game
+
+
+# The hero keeps his idle and walk animation through the opening seconds; only
+# after that does the view switch him to the pouring pose.
+func _test_pouring_starts_after_the_first_seconds() -> void:
+	_expect(is_equal_approx(GameStateClass.pour_progress(0.0), 0.0), "an empty mug is not being poured")
+	var delay_ratio := GameStateClass.COFFEE_POUR_DELAY / GameStateClass.COFFEE_CHARGE_TIME
+	_expect(GameStateClass.COFFEE_POUR_DELAY >= 1.0 and GameStateClass.COFFEE_POUR_DELAY <= 2.0, "the pour holds off for a second or two")
+	_expect(is_equal_approx(GameStateClass.pour_progress(delay_ratio * 0.99), 0.0), "nothing pours before the delay is up")
+	_expect(GameStateClass.pour_progress(delay_ratio + 0.01) > 0.0, "and the pour starts right after it")
+	_expect(is_equal_approx(GameStateClass.pour_progress(1.0), 1.0), "a full charge reads as a finished pour")
+
+
+func _test_standing_still_brews_a_single_player_throw() -> void:
+	var game := _started_game()
+	_expect(not game.is_armed(), "a fresh player has no coffee ready")
+	game.tick_charge(GameStateClass.COFFEE_CHARGE_TIME * 0.5)
+	_expect(game.move_player(Vector2i.RIGHT), "the half-brewed player takes a step")
+	_expect(is_equal_approx(game.charge_ratio(), 0.0), "a step spills a half-brewed coffee")
+	game.tick_charge(GameStateClass.COFFEE_CHARGE_TIME)
+	_expect(game.is_armed(), "standing still long enough brews a throw")
+	_expect(game.move_player(Vector2i.RIGHT), "the armed player takes a step")
+	_expect(game.is_armed(), "a full mug survives the step and waits to be thrown")
+	_expect(game.throw_coffee(), "and only the throw spends it")
+	_expect(not game.is_armed(), "after which the mug is empty again")
+
+
+func _test_single_player_throw_scalds_a_pod() -> void:
+	var game := _armed_solo()
+	var score_before := game.score
+	_expect(game.throw_coffee(), "an armed player can throw outside a match")
+	_expect(not game.enemy_alive[0], "the mug scalds the tea-pod it hits")
+	_expect(game.score == score_before + GameStateClass.ENEMY_SQUASH_SCORE, "a scalded pod pays a squash")
+
+
+func _test_single_player_throw_needs_a_full_charge() -> void:
+	var game := _armed_solo()
+	game.players[0].coffee_charge = GameStateClass.COFFEE_CHARGE_TIME - 0.01
+	_expect(not game.throw_coffee(), "a half-brewed coffee cannot be thrown")
+	_expect(game.enemy_alive[0], "and leaves the tea-pod alone")
+
+
+func _test_single_player_throw_range_and_walls() -> void:
+	var out_of_range := _armed_solo()
+	out_of_range.set_cell(out_of_range.player + Vector2i.RIGHT * 3, GameStateClass.Cell.TUNNEL)
+	out_of_range.enemies = [out_of_range.player + Vector2i.RIGHT * 3]
+	_expect(out_of_range.throw_coffee(), "the throw itself always happens")
+	_expect(out_of_range.enemy_alive[0], "a pod three cells away is out of range")
+
+	var walled := _armed_solo()
+	walled.set_cell(walled.player + Vector2i.RIGHT, GameStateClass.Cell.SOIL)
+	walled.throw_coffee()
+	_expect(walled.enemy_alive[0], "undug soil stops the mug before it reaches the pod")
+
+	var behind := _armed_solo()
+	behind.player_facing = Vector2i.LEFT
+	behind.throw_coffee()
+	_expect(behind.enemy_alive[0], "a pod behind the thrower is never hit")
+
+
+func _test_charge_fills_up_and_survives_a_step() -> void:
 	var match_state := MatchStateClass.new(11)
 	match_state.start_game()
 	_expect(not match_state.is_armed(0), "a fresh player has no coffee ready")
@@ -920,7 +997,7 @@ func _test_charge_fills_in_three_seconds_and_survives_a_step() -> void:
 	_expect(match_state.move_player(0, Vector2i.RIGHT), "the half-brewed player takes a step")
 	_expect(is_equal_approx(match_state.charge_ratio(0), 0.0), "a step spills a half-brewed coffee")
 	match_state.advance_time(MatchStateClass.COFFEE_CHARGE_TIME)
-	_expect(match_state.is_armed(0), "three seconds of standing still brews a throw")
+	_expect(match_state.is_armed(0), "standing still long enough brews a throw")
 	_expect(is_equal_approx(match_state.charge_ratio(0), 1.0), "a full charge reads as a full ring")
 	_expect(match_state.move_player(0, Vector2i.RIGHT), "the armed player takes a step")
 	_expect(match_state.is_armed(0), "a full mug survives the step and waits to be thrown")

@@ -44,6 +44,13 @@ const ENEMY_RESPAWN_DELAY := 14.0
 # further pod in the same fall doubles the payout.
 const MULTI_SQUASH_MULTIPLIER := 2
 const ENEMY_DIG_INTERVAL := 20
+# Seconds of standing still that brew one throw. The match layer scales its own
+# clocks off these, so single player and a match arm a mug at the same pace.
+const COFFEE_CHARGE_TIME := 5.0
+# The opening seconds of a brew are just standing there. Pouring only starts once
+# they are up, so a short pause never costs the hero his idle and walk animation.
+const COFFEE_POUR_DELAY := 1.6
+const THROW_RANGE := 2
 # Where pods queue up around the nest. Offsets, because the cross moves per level.
 const ENEMY_START_OFFSETS := [
 	Vector2i(0, 0), Vector2i(0, -1), Vector2i(0, 1), Vector2i(-1, 0), Vector2i(1, 0),
@@ -387,6 +394,90 @@ func filter_step_time() -> float:
 	return FILTER_STEP_TIME * 2.0 / LevelDataClass.speed(level_index)
 
 
+# How close a filter is to dropping: 0 while it still rests on solid ground,
+# 1 once the drop is committed. The view turns this into a warning wobble.
+func filter_fall_pressure(filter_index: int) -> float:
+	if filter_index < 0 or filter_index >= falling_filters.size() or filter_index >= falling_filter_states.size():
+		return 0.0
+	if falling_filter_states[filter_index]:
+		return 1.0
+	var cell: Vector2i = falling_filters[filter_index]
+	var below := cell + Vector2i.DOWN
+	if not is_inside(cell) or not is_inside(below):
+		return 0.0
+	if get_cell(below) != Cell.TUNNEL or falling_filters.has(below):
+		return 0.0
+	if not tunnel_opened_at.has(below):
+		return 1.0
+	return clampf((world_time - float(tunnel_opened_at[below])) / FRESH_TUNNEL_FALL_DELAY, 0.0, 1.0)
+
+
+# Standing still brews the mug. A match brews at its own level instead, because a
+# raider keeps charging on a board that ticks independently of their own.
+func tick_charge(delta: float) -> void:
+	if phase != Phase.PLAYING:
+		return
+	for slot in players:
+		slot.coffee_charge = minf(slot.coffee_charge + delta, COFFEE_CHARGE_TIME)
+
+
+func charge_ratio(player_index := 0) -> float:
+	if player_index < 0 or player_index >= players.size():
+		return 0.0
+	return clampf(players[player_index].coffee_charge / COFFEE_CHARGE_TIME, 0.0, 1.0)
+
+
+# How far along the visible pour is, which starts later than the charge itself.
+# Static because the match layer owns its own charge but shows the same mug.
+static func pour_progress(charge_value: float) -> float:
+	var delay := COFFEE_POUR_DELAY / COFFEE_CHARGE_TIME
+	return clampf((charge_value - delay) / maxf(1.0 - delay, 0.001), 0.0, 1.0)
+
+
+func is_armed(player_index := 0) -> bool:
+	return player_index >= 0 and player_index < players.size() and players[player_index].coffee_charge >= COFFEE_CHARGE_TIME
+
+
+func throw_coffee(player_index := 0) -> bool:
+	if phase != Phase.PLAYING or not is_armed(player_index):
+		return false
+	_sync_parallel_arrays()
+	var slot := players[player_index]
+	slot.coffee_charge = 0.0
+	event_emitted.emit(&"coffee_thrown", slot.cell, player_index)
+	var enemy_index := _throw_target(player_index)
+	if enemy_index >= 0:
+		_scald_enemy(enemy_index, player_index)
+	changed.emit()
+	return true
+
+
+# The mug travels the thrower's facing and stops at undug soil, so a pod behind a
+# wall is safe. Lining one up is the whole skill.
+func _throw_target(player_index: int) -> int:
+	var slot := players[player_index]
+	var cell := slot.cell
+	for step in range(THROW_RANGE):
+		cell += slot.facing
+		if not is_inside(cell) or get_cell(cell) == Cell.SOIL:
+			return -1
+		var enemy_index := _active_enemy_at(cell)
+		if enemy_index >= 0:
+			return enemy_index
+	return -1
+
+
+# A scalded pod leaves the board exactly as a filtered one does: same payout, same
+# long crawl back out of the nest. No chain bonus - one mug catches one pod.
+func _scald_enemy(enemy_index: int, player_index: int) -> void:
+	var cell: Vector2i = enemies[enemy_index]
+	enemy_alive[enemy_index] = false
+	enemy_respawn_at[enemy_index] = world_time + ENEMY_RESPAWN_DELAY
+	last_squash_score = ENEMY_SQUASH_SCORE
+	_add_score(player_index, last_squash_score)
+	event_emitted.emit(&"enemy_squashed", cell, player_index)
+
+
 func player_touch_delay() -> float:
 	return player_step_time() * CONTACT_TOUCH_FRACTION
 
@@ -448,6 +539,10 @@ func move_player(direction: Vector2i, player_index := 0) -> bool:
 	slot.arrives_at = world_time + player_touch_delay()
 	slot.cell = target
 	slot.facing = direction
+	# Walking is what stops you brewing - but a mug that is already full stays full
+	# until it is thrown, so an armed player can go hunting for a target.
+	if not is_armed(player_index):
+		slot.coffee_charge = 0.0
 	if get_cell(slot.cell) == Cell.SOIL:
 		set_cell(slot.cell, Cell.TUNNEL)
 		tunnel_opened_at[slot.cell] = world_time
