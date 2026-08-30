@@ -38,7 +38,7 @@ const TEAPOT_FIRST_LEVEL := 2
 # The plantation owner joins every level after a short visible delay, matching
 # the story's warning that lingering too long draws his attention.
 const ULTRA_FIRST_LEVEL := 0
-const ULTRA_SPAWN_TICK := 40
+const ULTRA_SPAWN_TICK := 50
 
 
 # How far past the last authored level we are; 0 while inside them.

@@ -7,6 +7,7 @@ const GameAudioClass = preload("res://scripts/audio.gd")
 const SaveDataClass = preload("res://scripts/save_data.gd")
 const MatchStateClass = preload("res://scripts/match_state.gd")
 const NetLinkClass = preload("res://scripts/net_link.gd")
+const TouchControlsClass = preload("res://scripts/touch_controls.gd")
 const TILE := 48
 const BOARD_ORIGIN := Vector2(12, 6)
 const BOARD_SIZE := Vector2(GameStateClass.WIDTH * TILE, GameStateClass.HEIGHT * TILE)
@@ -145,6 +146,12 @@ var remote_move_cooldown: Array[float] = []
 var portal_node: Node2D
 # A rematch starts only once everybody has said yes.
 var rematch_ready: Array[bool] = []
+var touch: TouchControls
+# The button set is rebuilt only when the screen behind it changes.
+var touch_button_key := ""
+# Taps collected since the last physics frame; see touch_controls.gd for why the
+# engine's own action state cannot carry them.
+var touch_fired: Array[StringName] = []
 var lobby_address: LineEdit
 var lobby_list: Label
 var name_field: LineEdit
@@ -174,6 +181,7 @@ func _ready() -> void:
 	actors.add_child(coffee_cup)
 	_build_overlay()
 	_build_net()
+	_build_touch_controls()
 	state.changed.connect(_refresh)
 	state.event_emitted.connect(_on_game_event)
 	_refresh()
@@ -322,6 +330,92 @@ func _build_overlay() -> void:
 	overlay.add_child(name_field)
 
 
+func _build_touch_controls() -> void:
+	# Above the overlay, so the menu buttons stay reachable while it is up.
+	var layer := CanvasLayer.new()
+	layer.layer = 3
+	add_child(layer)
+	touch = TouchControlsClass.new()
+	layer.add_child(touch)
+	touch.pressed.connect(_on_touch_pressed)
+
+
+# Only the entries a key alone cannot reach are handled here; the rest carry an
+# input action and land in the same _handle_ui_input paths as the keyboard.
+func _on_touch_pressed(id: StringName) -> void:
+	# A focused field swallows every shortcut, and on a phone there is no other
+	# way back out of it.
+	var focused := get_viewport().gui_get_focus_owner()
+	if focused != null:
+		focused.release_focus()
+	match id:
+		&"network":
+			_show_lobby()
+		&"host":
+			net.host(SaveDataClass.player_name())
+			overlay_body.text = net.status_text
+
+
+func _sync_touch_buttons() -> void:
+	if not touch.visible:
+		return
+	var key := "%d|%d|%d" % [ui_mode, int(match_state != null), int(net.is_online() and net.is_host())]
+	if key == touch_button_key:
+		return
+	touch_button_key = key
+	touch.stick_live = ui_mode == UiMode.PLAYING
+	touch.set_buttons(_touch_button_specs())
+
+
+func _touch_button_specs() -> Array:
+	match ui_mode:
+		UiMode.TITLE:
+			return [
+				{"id": &"confirm", "label": "PLAY", "place": &"primary", "action": &"confirm"},
+				{"id": &"network", "label": "NET", "place": &"secondary"},
+			]
+		UiMode.LOBBY:
+			var specs: Array = [{"id": &"back", "label": "BACK", "place": &"corner", "action": &"to_title"}]
+			if net.is_online():
+				# Only the host may call the start, so a guest gets no button.
+				if net.is_host():
+					specs.append({"id": &"start", "label": "START", "place": &"primary", "action": &"confirm"})
+			else:
+				specs.append({"id": &"host", "label": "HOST", "place": &"primary"})
+			return specs
+		UiMode.GAME_OVER:
+			return [
+				{"id": &"again", "label": "AGAIN", "place": &"primary", "action": &"confirm"},
+				{"id": &"title", "label": "TITLE", "place": &"secondary", "action": &"to_title"},
+			]
+		UiMode.PAUSED:
+			return [
+				{"id": &"resume", "label": "RESUME", "place": &"primary", "action": &"pause"},
+				{"id": &"restart", "label": "RESTART", "place": &"secondary", "action": &"restart"},
+				{"id": &"title", "label": "TITLE", "place": &"corner", "action": &"to_title"},
+			]
+	# A race has no pause of its own - the other plantations keep running.
+	return [
+		{"id": &"throw", "label": "THROW", "place": &"primary", "action": &"throw"},
+		{
+			"id": &"leave", "label": "QUIT" if match_state != null else "PAUSE", "place": &"corner",
+			"action": &"to_title" if match_state != null else &"pause",
+		},
+	]
+
+
+# A key this frame, or a button tapped since the last one. Edge-triggered either
+# way: a held button never fires twice.
+func _action_pressed(action: StringName) -> bool:
+	return Input.is_action_just_pressed(action) or touch_fired.has(action)
+
+
+# The touch joystick replaces the mouse drag rather than adding to it: on a
+# handheld the emulated mouse is the same finger.
+func _tilt_vector() -> Vector2:
+	return touch.tilt if touch.visible else virtual_tilt
+
+
 func _build_net() -> void:
 	net = NetLinkClass.new()
 	net.name = "NetLink"
@@ -344,7 +438,8 @@ func _show_lobby() -> void:
 	overlay.visible = true
 	name_field.visible = false
 	overlay_title.text = "PLANTATION RACE"
-	overlay_body.text = "Up to four plantations, linked in a ring by portals.\n\nH  host a game and wait for players\nESC  back to the title"
+	var keys := "HOST  open a game and wait for players\nBACK  to the title\n(joining a game still needs a keyboard)" if touch.visible else "H  host a game and wait for players\nESC  back to the title"
+	overlay_body.text = "Up to four plantations, linked in a ring by portals.\n\n%s" % keys
 	lobby_list.visible = true
 	lobby_address.visible = true
 	net.start_browsing()
@@ -652,7 +747,13 @@ func _show_title() -> void:
 	overlay.visible = true
 	name_field.visible = true
 	overlay_title.text = "COFFEE HUNTER"
-	overlay_body.text = "Grounds for Adventure\n\n%s\n\nWASD / ARROWS to dig  -  drag the mouse to tilt\nSPACE  single player    N  network race    P pause  R restart  M mute" % _high_score_lines()
+	overlay_body.text = "Grounds for Adventure\n\n%s\n\n%s" % [_high_score_lines(), _controls_hint()]
+
+
+func _controls_hint() -> String:
+	if touch.visible:
+		return "DRAG the left half to dig  -  or tilt the device\nPLAY  single player      NET  network race"
+	return "WASD / ARROWS to dig  -  drag the mouse to tilt\nSPACE  single player    N  network race    P pause  R restart  M mute"
 
 
 # The five best runs. Only single-player runs land here: match scores carry stolen
@@ -691,7 +792,8 @@ func _show_game_over(is_record: bool) -> void:
 	var record := "SCORE  %d      BEST  %d" % [state.score, high_score]
 	if is_record:
 		record = "NEW BEST  %d" % state.score
-	overlay_body.text = "%s\nReached level %d\n\nSPACE or R for a new run      ESC for the title" % [record, state.level_index + 1]
+	var again := "AGAIN for a new run      TITLE to step back" if touch.visible else "SPACE or R for a new run      ESC for the title"
+	overlay_body.text = "%s\nReached level %d\n\n%s" % [record, state.level_index + 1, again]
 
 
 func _set_paused(paused: bool) -> void:
@@ -745,7 +847,7 @@ func _handle_ui_input() -> bool:
 		# name is being edited.
 		if name_field.has_focus():
 			return true
-		if Input.is_action_just_pressed("confirm"):
+		if _action_pressed("confirm"):
 			_begin_run()
 		elif Input.is_key_pressed(KEY_N):
 			_show_lobby()
@@ -754,40 +856,40 @@ func _handle_ui_input() -> bool:
 		_handle_lobby_input()
 		return true
 	if ui_mode == UiMode.GAME_OVER:
-		if Input.is_action_just_pressed("to_title"):
+		if _action_pressed("to_title"):
 			_leave_match()
 			_show_title()
-		elif Input.is_action_just_pressed("confirm") or Input.is_action_just_pressed("restart"):
+		elif _action_pressed("confirm") or _action_pressed("restart"):
 			if match_state != null:
 				_request_rematch()
 			else:
 				_begin_run()
 		return true
 	if ui_mode == UiMode.PAUSED:
-		if Input.is_action_just_pressed("pause") or Input.is_action_just_pressed("confirm"):
+		if _action_pressed("pause") or _action_pressed("confirm"):
 			_set_paused(false)
-		elif Input.is_action_just_pressed("restart"):
+		elif _action_pressed("restart"):
 			_begin_run()
-		elif Input.is_action_just_pressed("to_title"):
+		elif _action_pressed("to_title"):
 			_show_title()
 		return true
-	if Input.is_action_just_pressed("to_title"):
+	if _action_pressed("to_title"):
 		_leave_match()
 		_show_title()
 		return true
 	if match_state != null:
 		return false
-	if Input.is_action_just_pressed("pause"):
+	if _action_pressed("pause"):
 		_set_paused(true)
 		return true
-	if Input.is_action_just_pressed("restart"):
+	if _action_pressed("restart"):
 		_begin_run()
 		return true
 	return false
 
 
 func _handle_lobby_input() -> void:
-	if Input.is_action_just_pressed("to_title"):
+	if _action_pressed("to_title"):
 		# Leaving the waiting room has to drop the link too, or the peer keeps
 		# running behind the title screen.
 		if net.is_online():
@@ -804,7 +906,7 @@ func _handle_lobby_input() -> void:
 	# the peer every frame.
 	if net.is_online():
 		# Only the host may call the start, and never on an empty room.
-		if net.is_host() and net.roster.size() >= 2 and Input.is_action_just_pressed("confirm"):
+		if net.is_host() and net.roster.size() >= 2 and _action_pressed("confirm"):
 			var seed_value := randi() & 0x7fffffff
 			var count := net.roster.size()
 			net.broadcast_match_start(seed_value, count)
@@ -863,14 +965,16 @@ func _process(delta: float) -> void:
 
 func _physics_process(delta: float) -> void:
 	elapsed += delta
-	if Input.is_action_just_pressed("mute"):
+	touch_fired = touch.take_fired()
+	if _action_pressed("mute"):
 		_toggle_mute()
+	_sync_touch_buttons()
 	if _handle_ui_input():
 		queue_redraw()
 		return
 
-	var direction := resolver.direction_from_vector(resolver.combined_vector(virtual_tilt))
-	var throw_pressed := Input.is_action_just_pressed("throw")
+	var direction := resolver.direction_from_vector(resolver.combined_vector(_tilt_vector()))
+	var throw_pressed := _action_pressed("throw")
 	if match_state != null:
 		_process_match(delta, direction, throw_pressed)
 		queue_redraw()
@@ -921,6 +1025,8 @@ func _physics_process(delta: float) -> void:
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	if touch.visible:
+		return
 	if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
 		dragging = event.pressed
 		if dragging:
@@ -1600,7 +1706,7 @@ func _spawn_impact_specks(cell: Vector2i, color: Color) -> void:
 
 
 func _draw() -> void:
-	if dragging:
+	if dragging and not touch.visible:
 		draw_circle(drag_origin, 36.0, Color(1, 1, 1, 0.12))
 		draw_circle(drag_origin + virtual_tilt * 36.0, 12.0, Color("ffd27a"))
 	var border := Rect2(BOARD_ORIGIN - Vector2.ONE, BOARD_SIZE + Vector2.ONE * 2.0)

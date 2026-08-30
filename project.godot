@@ -11,6 +11,12 @@ window/size/window_width_override=1440
 window/size/window_height_override=810
 window/stretch/mode="canvas_items"
 
+[input_devices]
+
+# input_resolver reads Input.get_gravity() for the tilt steering; without this the
+# sensor stays off on Android and every call warns instead of returning a reading.
+sensors/enable_gravity=true
+
 [rendering]
 renderer/rendering_method="gl_compatibility"
 renderer/rendering_method.mobile="gl_compatibility"

@@ -132,3 +132,16 @@ godot --headless --path . --export-release macOS "build/Coffee Hunter.app"
 
 Generated project assets and their final prompts are documented in `docs/art/asset-prompts.md`.
 The first macOS size measurement is recorded in `docs/build-baseline.md`.
+
+## License
+
+The **code** is licensed under the Apache License 2.0 — see `LICENSE`. In short:
+you may use, change and ship it, including commercially, as long as you keep the
+copyright notice and the `NOTICE` file, and mark the files you changed.
+
+The **art, sound effects, story text and the name "Coffee Hunter"** are not part
+of that grant. They remain all rights reserved, so a fork stands on its own
+presentation rather than wearing this one. Ask if you want to use them.
+
+Neither covers the idea itself: game rules and mechanics are not protected by
+copyright, and nothing here is meant to suggest otherwise.

@@ -7,6 +7,7 @@ const GameAudioClass = preload("res://scripts/audio.gd")
 const SaveDataClass = preload("res://scripts/save_data.gd")
 const MatchStateClass = preload("res://scripts/match_state.gd")
 const NetLinkClass = preload("res://scripts/net_link.gd")
+const TouchControlsClass = preload("res://scripts/touch_controls.gd")
 var failures := 0
 
 
@@ -91,6 +92,10 @@ func _init() -> void:
 	_test_a_finished_snapshot_ends_the_match_on_the_client()
 	_test_net_link_offers_a_rematch_handshake()
 	_test_throw_key_is_bound()
+	_test_touch_pad_presses_the_same_actions_as_the_keyboard()
+	await _test_every_touch_button_is_wired()
+	await _test_tapping_play_starts_a_run()
+	await _test_a_real_touch_event_reaches_the_pad()
 	if failures == 0:
 		print("PASS: all Coffee Hunter tests")
 	quit(failures)
@@ -1380,3 +1385,115 @@ func _test_throw_key_is_bound() -> void:
 	for event in InputMap.action_get_events("throw"):
 		bound = bound or event is InputEventKey
 	_expect(bound, "the coffee throw is reachable from the keyboard")
+
+
+func _test_touch_pad_presses_the_same_actions_as_the_keyboard() -> void:
+	var pad := TouchControlsClass.new()
+	pad.size = Vector2(960, 540)
+	pad.stick_live = true
+	pad.set_buttons([
+		{"id": &"throw", "label": "THROW", "place": &"primary", "action": &"throw"},
+	])
+	var primary: Vector2 = TouchControlsClass.PLACES[&"primary"]["center"]
+	pad._begin_touch(0, primary)
+	_expect(pad.take_fired() == [&"throw"], "a tap on the pad queues the throw action")
+	_expect(pad.take_fired().is_empty(), "and draining it twice never fires it twice")
+	# The whole point of reading raw touches: the emulated mouse follows one
+	# finger, so holding a button and steering would be mutually exclusive.
+	pad._begin_touch(1, Vector2(200, 400))
+	_expect(pad._drag(1, Vector2(260, 400)), "the stick still steers while the button is held")
+	_expect(pad.tilt.x > 0.0, "and the tilt follows the finger")
+	pad._end_touch(1)
+	pad._end_touch(0)
+
+	# A tap far shorter than a physics frame still has to register.
+	pad._begin_touch(0, primary)
+	pad._end_touch(0)
+	_expect(pad.take_fired() == [&"throw"], "a tap released before the next frame still fires")
+
+	_expect(pad._begin_touch(0, Vector2(200, 400)), "the left half starts the stick")
+	_expect(pad.tilt == Vector2.ZERO, "which begins centred")
+	pad._end_touch(0)
+	_expect(not pad._begin_touch(0, Vector2(900, 400)), "the right half never does")
+	pad.free()
+
+
+func _test_every_touch_button_is_wired() -> void:
+	var main: Variant = load("res://scenes/main.tscn").instantiate()
+	root.add_child(main)
+	await process_frame
+	for mode in [main.UiMode.TITLE, main.UiMode.LOBBY, main.UiMode.PLAYING, main.UiMode.PAUSED, main.UiMode.GAME_OVER]:
+		main.ui_mode = mode
+		for spec: Dictionary in main._touch_button_specs():
+			var action: StringName = spec.get("action", &"")
+			_expect(action == &"" or InputMap.has_action(action), "touch button %s maps to a real action" % spec["id"])
+			_expect(TouchControlsClass.PLACES.has(spec["place"]), "touch button %s sits in a known place" % spec["id"])
+	await create_timer(0.8).timeout
+	main.queue_free()
+	await process_frame
+
+
+# The button queued its action with Input.action_press once, which stamps the
+# frame the tap happened on - a frame no physics tick ever ran on, so PLAY did
+# nothing on the phone while ENTER worked.
+func _test_tapping_play_starts_a_run() -> void:
+	var main: Variant = load("res://scenes/main.tscn").instantiate()
+	root.add_child(main)
+	await process_frame
+	main.touch.visible = true
+	main.touch_button_key = ""
+	var guard := 0
+	while main.touch._buttons.is_empty() and guard < 10:
+		await physics_frame
+		guard += 1
+	_expect(not main.touch._buttons.is_empty(), "the title screen lays out its touch buttons")
+	_expect(main.ui_mode == main.UiMode.TITLE, "the game opens on the title")
+	main.touch._begin_touch(0, TouchControlsClass.PLACES[&"primary"]["center"])
+	main.touch._end_touch(0)
+	await physics_frame
+	_expect(main.ui_mode == main.UiMode.PLAYING, "tapping PLAY starts a run on the very next frame")
+	await create_timer(0.8).timeout
+	main.queue_free()
+	await process_frame
+
+
+# The pad used to listen on _unhandled_input, where it never heard anything: the
+# menu overlay covers the viewport with a ColorRect that stops the mouse, and the
+# emulated-mouse pass consumes the touch with it. Pressing PLAY on the phone did
+# nothing while ENTER, which is bound to confirm, still worked.
+func _test_a_real_touch_event_reaches_the_pad() -> void:
+	var main: Variant = load("res://scenes/main.tscn").instantiate()
+	root.add_child(main)
+	await process_frame
+	main.touch.visible = true
+	main.touch_button_key = ""
+	var guard := 0
+	while main.touch._buttons.is_empty() and guard < 10:
+		await physics_frame
+		guard += 1
+	_expect(main.overlay.visible, "the title overlay is up, as it is on a phone")
+
+	var down := InputEventScreenTouch.new()
+	down.index = 0
+	down.pressed = true
+	down.position = TouchControlsClass.PLACES[&"primary"]["center"]
+	main.get_viewport().push_input(down, true)
+	await physics_frame
+	await physics_frame
+	_expect(main.ui_mode == main.UiMode.PLAYING, "a touch delivered by the engine reaches PLAY through the overlay")
+
+	# And the field below the pad must still be reachable, or the lobby would
+	# lose its address box to the joystick.
+	main._show_lobby()
+	await physics_frame
+	var on_field := InputEventScreenTouch.new()
+	on_field.index = 0
+	on_field.pressed = true
+	on_field.position = main.lobby_address.position + main.lobby_address.size * 0.5
+	main.get_viewport().push_input(on_field, true)
+	await physics_frame
+	_expect(main.touch._move_finger == -1, "a tap on the address field never becomes a joystick")
+
+	await create_timer(0.8).timeout
+	main.queue_free()
+	await process_frame
