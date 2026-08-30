@@ -9,23 +9,9 @@
       <stop offset="0.55" stop-color="#7d4718"/>
       <stop offset="1" stop-color="#4c2a0e"/>
     </linearGradient>
-    <linearGradient id="tunnel" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#2a1a14"/>
-      <stop offset="1" stop-color="#120c0a"/>
-    </linearGradient>
   </defs>
 
   <rect width="256" height="256" rx="52" fill="url(#soil)"/>
-
-  <!-- dug tunnels: the cross-corridor the level always starts with -->
-  <g fill="url(#tunnel)">
-    <rect x="0" y="106" width="256" height="44"/>
-    <rect x="106" y="0" width="44" height="256"/>
-  </g>
-  <g fill="none" stroke="#5e3726" stroke-width="3" opacity="0.75">
-    <path d="M0 106 H256 M0 150 H256"/>
-    <path d="M106 0 V256 M150 0 V256"/>
-  </g>
 
   <!-- coffee bean -->
   <g transform="translate(128 128) rotate(-24)">
@@ -39,6 +25,4 @@
     <path d="M-55 -29 C-31 -45 7 -41 35 -27" fill="none" stroke="#ffd27a" stroke-width="7"
           stroke-linecap="round" opacity="0.6"/>
   </g>
-
-  <rect x="4" y="4" width="248" height="248" rx="50" fill="none" stroke="#ffd27a" stroke-width="6" opacity="0.5"/>
 </svg>

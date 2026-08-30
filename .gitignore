@@ -4,3 +4,6 @@ build/
 original/
 .serena
 .tokensave
+/android/
+*.keystore
+*.jks
