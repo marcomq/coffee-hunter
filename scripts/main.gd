@@ -86,6 +86,23 @@ const SNAPSHOT_INTERVAL := 1.0 / 15.0
 # One colour per slot, so the figure on the board and the line in the side panel
 # read as the same person. Slot 0 keeps the untinted hero.
 const PLAYER_TINTS: Array[Color] = [Color.WHITE, Color("9ed6f0"), Color("a8e6a0"), Color("f0a8d8")]
+# The side panel is one 102px text column running down to PANEL_BOTTOM. The
+# roster takes the top of it during a match and the status text takes whatever is
+# left. Nothing else may be drawn in it while a run is on screen - see PANEL_EDGE
+# in touch_controls.gd, which is why the pad's buttons sit to the left of it.
+const PANEL_X := 850.0
+const PANEL_WIDTH := 102.0
+const PANEL_TOP := 240.0
+const PANEL_BOTTOM := 532.0
+const ROSTER_NAME_SIZE := 13
+const ROSTER_STAT_SIZE := 11
+# The lobby stacks body text, then the list of games or players, then the address
+# field. The body is not a fixed height - the touch hints run a line longer than
+# the keyboard ones - so the list is placed under what it measures, not under
+# where it usually ends.
+const LOBBY_BODY_TOP := 226.0
+const LOBBY_LIST_GAP := 10.0
+const LOBBY_ADDRESS_TOP := 452.0
 
 var state: GameState
 var resolver: InputResolver
@@ -243,15 +260,18 @@ func _build_hud() -> void:
 	add_child(best_label)
 	# Rich text, because every player is named in their own colour - the same one
 	# their figure wears on the board.
-	roster_label = _rich_label(13)
-	roster_label.position = Vector2(850, 238)
-	roster_label.size = Vector2(102, 150)
+	roster_label = _rich_label(ROSTER_NAME_SIZE)
+	roster_label.position = Vector2(PANEL_X, PANEL_TOP)
+	roster_label.size = Vector2(PANEL_WIDTH, 150)
 	roster_label.visible = false
 	add_child(roster_label)
 	status_label = _label("", 16, Color("d9efb3"))
-	status_label.position = Vector2(850, 252)
-	status_label.size = Vector2(102, 130)
+	status_label.position = Vector2(PANEL_X, PANEL_TOP)
+	status_label.size = Vector2(PANEL_WIDTH, 130)
 	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	# The box is an edge, not a hint: a Label happily draws past its own rect, and
+	# _layout_panel is only telling the truth about the space if this clips.
+	status_label.clip_text = true
 	add_child(status_label)
 
 func _rich_label(size: int) -> RichTextLabel:
@@ -288,7 +308,7 @@ func _build_overlay() -> void:
 	overlay_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	overlay.add_child(overlay_title)
 	overlay_body = _label("", 17, Color("f0e3d2"))
-	overlay_body.position = Vector2(0, 226)
+	overlay_body.position = Vector2(0, LOBBY_BODY_TOP)
 	overlay_body.size = Vector2(960, 280)
 	overlay_body.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	overlay.add_child(overlay_body)
@@ -296,6 +316,7 @@ func _build_overlay() -> void:
 	lobby_list.position = Vector2(0, 330)
 	lobby_list.size = Vector2(960, 120)
 	lobby_list.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lobby_list.clip_text = true
 	lobby_list.visible = false
 	overlay.add_child(lobby_list)
 	lobby_address = LineEdit.new()
@@ -453,6 +474,35 @@ func _hide_lobby_widgets() -> void:
 		net.stop_browsing()
 
 
+# The body above the list is as tall as the hints it is carrying, and on a phone
+# those run a line longer - which is how the list came to be drawn over the last
+# line of it. Both are laid out against what the body measures.
+func _layout_lobby() -> void:
+	var top := LOBBY_BODY_TOP + float(overlay_body.get_line_count()) * overlay_body.get_line_height()
+	top += LOBBY_LIST_GAP
+	lobby_list.position.y = top
+	lobby_list.size.y = maxf(LOBBY_ADDRESS_TOP - LOBBY_LIST_GAP - top, 0.0)
+
+
+# As many rows as the box actually holds. Nine games found on a busy network ran
+# a long way past the address field and off the bottom of the screen.
+func _fit_lobby_rows(header: String, rows: Array) -> String:
+	var line_height := maxf(lobby_list.get_line_height(), 1.0)
+	var room := maxi(int(lobby_list.size.y / line_height), 2)
+	# The waiting room passes no header, and must not be charged a row for one.
+	var header_rows := 0 if header == "" else 1
+	var shown := rows.size()
+	if shown + header_rows > room:
+		# One row of the budget goes to saying how many are not being shown.
+		shown = maxi(room - header_rows - 1, 0)
+	var text := header
+	for index in range(shown):
+		text += rows[index]
+	if shown < rows.size():
+		text += "...and %d more\n" % (rows.size() - shown)
+	return text
+
+
 # One label, two jobs: the games out on the network before joining, the players
 # in the room afterwards.
 func _refresh_lobby_list() -> void:
@@ -461,28 +511,26 @@ func _refresh_lobby_list() -> void:
 	if net.is_online():
 		_show_waiting_room()
 		return
+	_layout_lobby()
 	if net.found_games.is_empty():
 		lobby_list.text = "Searching the local network...\n(or click the field below, type an address, ENTER)"
 		return
-	var lines := "Games found - press a number key to join:\n"
+	var rows: Array = []
 	for index in range(mini(net.found_games.size(), 9)):
 		var entry: Dictionary = net.found_games[index]
-		lines += "%d)  %s   %s   (%d/%d)\n" % [
+		rows.append("%d)  %s   %s   (%d/%d)\n" % [
 			index + 1, entry["name"], entry["address"],
 			int(entry.get("players", 1)), NetLinkClass.MAX_PLAYERS,
-		]
-	lobby_list.text = lines
+		])
+	lobby_list.text = _fit_lobby_rows("Games found - press a number key to join:\n", rows)
 
 
 # Nobody drops into a race unannounced: the host waits until the room is as full
 # as it is going to get and says when.
 func _show_waiting_room() -> void:
 	overlay_title.text = "WAITING ROOM"
-	var lines := ""
-	for entry in net.roster:
-		var mark := "   (you)" if int(entry["index"]) == local_player else ""
-		lines += "%d)  %s%s\n" % [int(entry["index"]) + 1, entry["name"], mark]
-	lobby_list.text = lines
+	# The body is written before the list is placed: _layout_lobby measures it,
+	# and measuring the previous screen's text puts the list in the wrong place.
 	if not net.is_host():
 		overlay_body.text = "%s\n\nThe host starts the race.      ESC to cancel" % net.status_text
 	elif net.roster.size() >= 2:
@@ -491,6 +539,12 @@ func _show_waiting_room() -> void:
 		]
 	else:
 		overlay_body.text = "Waiting for players...\n\nESC to cancel"
+	_layout_lobby()
+	var rows: Array = []
+	for entry in net.roster:
+		var mark := "   (you)" if int(entry["index"]) == local_player else ""
+		rows.append("%d)  %s%s\n" % [int(entry["index"]) + 1, entry["name"], mark])
+	lobby_list.text = _fit_lobby_rows("", rows)
 
 
 func _on_address_submitted(address: String) -> void:
@@ -545,7 +599,7 @@ func _begin_match(seed_value: int, player_count: int) -> void:
 func _on_link_lost(reason: String) -> void:
 	match_state = null
 	_show_title()
-	overlay_title.text = "VERBINDUNG WEG"
+	overlay_title.text = "CONNECTION LOST"
 	overlay_body.text = "%s\n\nSPACE for a new run      ESC for the title" % reason
 
 
@@ -1112,35 +1166,71 @@ func _refresh() -> void:
 	best_label.text = "BEST  %d" % maxi(high_score, shown_slot.score)
 	if audio and audio.muted:
 		best_label.text += "   MUTED"
-	# The field of players drops in above the controls, so the controls move down.
+	# The field of players drops in above the status text, so the status text moves
+	# down by however tall the field actually is.
 	roster_label.visible = match_state != null
-	status_label.position.y = 392.0 if match_state != null else 252.0
 	if match_state != null:
 		roster_label.text = _roster_panel_text()
+	_layout_panel()
+	status_label.text = _status_text()
+
+
+# The roster is measured, not guessed: four players stand twice as tall as two,
+# and the status text is given exactly what they leave behind.
+func _layout_panel() -> void:
+	var top := PANEL_TOP
+	if match_state != null:
+		var font := ThemeDB.fallback_font
+		var per_player := font.get_height(ROSTER_NAME_SIZE) + font.get_height(ROSTER_STAT_SIZE)
+		var height := per_player * match_state.player_count()
+		roster_label.size = Vector2(PANEL_WIDTH, height)
+		top += height + 6.0
+	status_label.position = Vector2(PANEL_X, top)
+	status_label.size = Vector2(PANEL_WIDTH, maxf(PANEL_BOTTOM - top, 0.0))
+
+
+# On a phone the keyboard hints name keys that are not there, and the column is
+# little more than half as tall, so every state says less. Each string has to fit
+# the box _layout_panel hands it - run_tests.gd measures them all.
+func _status_text() -> String:
+	var pad := touch != null and touch.visible
+	# A match spends the top half of the column on the roster, so it is as short
+	# of room as a phone is.
+	var brief := pad or match_state != null
 	match state.phase:
 		GameStateClass.Phase.READY:
-			status_label.text = "PRESS A DIRECTION\nTO START\n\nWASD / ARROWS\nor drag to tilt"
+			if pad:
+				return "DRAG TO\nSTART"
+			if brief:
+				return "PRESS A\nDIRECTION\nTO START"
+			return "PRESS A DIRECTION\nTO START\n\nWASD / ARROWS\nor drag to tilt"
 		GameStateClass.Phase.WON:
+			if brief:
+				return "CLEARED!\n\nDrag on" if pad else "CLEARED!\n\nPress on"
 			if LevelDataClass.is_endless(state.level_index):
-				status_label.text = "LEVEL CLEARED!\nPast the map now.\n\nPress a direction\nto keep going"
-			else:
-				status_label.text = "LEVEL CLEARED!\n\nPress a direction\nfor next level"
+				return "LEVEL CLEARED!\nPast the map now.\n\nPress a direction\nto keep going"
+			return "LEVEL CLEARED!\n\nPress a direction\nfor next level"
 		GameStateClass.Phase.GAME_OVER:
-			status_label.text = "FILTERED OUT.\n\nPress R"
-		_:
-			var level_line := "LEVEL %d" % (state.level_index + 1)
-			if LevelDataClass.is_endless(state.level_index):
-				level_line += "  ENDLESS"
-			if match_state != null and match_state.players[local_player].is_out:
-				status_label.text = "KNOCKED OUT\n\nWatching the\nothers race.\n\nESC  QUIT"
-			elif match_state != null:
-				status_label.text = "%s\n\nF  THROW\nCOFFEE\n\nESC  QUIT" % level_line
-			else:
-				status_label.text = "%s\nSPEED %.1f\n\nWASD / ARROWS\nDrag mouse to tilt\n\nP pause  R restart" % [level_line, LevelDataClass.speed(state.level_index)]
+			if brief:
+				return "FILTERED\nOUT." if pad else "FILTERED\nOUT.\n\nPress R"
+			return "FILTERED OUT.\n\nPress R"
+	var level_line := "LEVEL %d" % (state.level_index + 1)
+	if LevelDataClass.is_endless(state.level_index):
+		level_line += "  ENDLESS"
+	if match_state != null and match_state.players[local_player].is_out:
+		return "KNOCKED\nOUT" if pad else "KNOCKED\nOUT\n\nESC  QUIT"
+	if match_state != null:
+		return level_line if pad else "%s\n\nF  THROW\nESC  QUIT" % level_line
+	var speed_line := "%s\nSPEED %.1f" % [level_line, LevelDataClass.speed(state.level_index)]
+	if pad:
+		return speed_line
+	return "%s\n\nWASD / ARROWS\nDrag mouse to tilt\n\nP pause  R restart" % speed_line
 
 
 # Two lines per player - name, then standing - each in that player's own colour,
-# the one their figure wears on the board.
+# the one their figure wears on the board. The second line is set smaller because
+# at the name's size it wrapped, which made four players twice as tall as the
+# panel and quietly dropped the last two off the bottom of it.
 func _roster_panel_text() -> String:
 	var lines := ""
 	for player_index in range(match_state.player_count()):
@@ -1152,9 +1242,9 @@ func _roster_panel_text() -> String:
 			standing = "YOU"
 		elif match_state.world_of_player[player_index] == shown_world:
 			standing = "HERE!"
-		lines += "[color=#%s]%s[/color]\n  %d  L%d  %s\n" % [
+		lines += "[color=#%s]%s[/color]\n[font_size=%d] %d L%d %s[/font_size]\n" % [
 			_player_tint(player_index).to_html(false), _player_name(player_index),
-			slot.score, slot.lives, standing,
+			ROSTER_STAT_SIZE, slot.score, slot.lives, standing,
 		]
 	return lines
 
@@ -1769,7 +1859,8 @@ func _build_charge_ring() -> Line2D:
 
 # The mug drawn into the hero sheet is a few pixels across, so the brew gets a
 # sprite of its own at hand height. While it fills it stays small and faint on
-# purpose: the jump to a solid, bobbing cup is what says the throw is ready.
+# purpose: the jump to a solid, full-size, bobbing cup is what says the throw is
+# ready, and a half-brewed mug must never be mistaken for one.
 func _update_coffee_cup() -> void:
 	var ratio := match_state.charge_ratio(local_player) if match_state != null else state.charge_ratio(_local_board_index())
 	var pour := GameStateClass.pour_progress(ratio)
@@ -1782,8 +1873,10 @@ func _update_coffee_cup() -> void:
 	var side := 13.0 if _local_slot().facing.x >= 0 else -13.0
 	var bob := sin(elapsed * (5.0 if armed else 2.4)) * (2.0 if armed else 0.6)
 	coffee_cup.position = player_node.position + Vector2(side, -4.5 + bob)
-	coffee_cup.scale = Vector2.ONE * ((1.0 + sin(elapsed * 6.0) * 0.08) if armed else (0.6 + pour * 0.25))
-	# coffee_cup.modulate = Color(1, 1, 1, 1.0 if armed else 0.18 + pour * 0.32)
+	coffee_cup.scale = Vector2.ONE * ((1.0 + sin(elapsed * 6.0) * 0.08) if armed else (0.42 + pour * 0.26))
+	# Fades the shadow with it: _art_node gives that child its own alpha, and a
+	# parent's modulate multiplies through to it.
+	coffee_cup.modulate = Color(1, 1, 1, 1.0 if armed else 0.22 + pour * 0.43)
 
 
 func _update_charge_ring() -> void:

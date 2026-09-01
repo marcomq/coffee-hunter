@@ -3,6 +3,11 @@ config/name="Coffee Hunter: Grounds for Adventure"
 run/main_scene="res://scenes/main.tscn"
 config/features=PackedStringArray("4.7")
 config/icon="res://assets/art/branding/icon.svg"
+; Kein Godot-Logo beim Start. Die Farbe ist die des Spielhintergrunds
+; (RenderingServer.set_default_clear_color in main.gd), damit der Start nicht
+; erst grau aufblitzt, bevor der Titel kommt.
+boot_splash/show_image=false
+boot_splash/bg_color=Color(0.0901961, 0.0666667, 0.0588235, 1)
 
 [display]
 window/size/viewport_width=960

@@ -39,9 +39,14 @@ const LABEL := Color("fff3df")
 # The joystick only claims the half of the screen the board sits under, so a
 # stray tap near the buttons never drags the hero.
 const JOYSTICK_ZONE := 0.55
+# The primary button sits clear of x=840, where the side panel's text column
+# begins: it used to be centred on that column, and the status text was drawn
+# straight through the ring. `secondary` may sit in the column because every
+# screen that uses it has the menu overlay up, which covers the panel anyway.
+const PANEL_EDGE := 840.0
 const PLACES := {
-	&"primary": {"center": Vector2(886, 462), "radius": 52.0},
-	&"secondary": {"center": Vector2(770, 486), "radius": 38.0},
+	&"primary": {"center": Vector2(762, 462), "radius": 52.0},
+	&"secondary": {"center": Vector2(886, 470), "radius": 38.0},
 	&"corner": {"center": Vector2(44, 44), "radius": 30.0},
 }
 

@@ -90,8 +90,15 @@ func _init() -> void:
 	_test_snapshot_roundtrip_survives_a_player_mid_raid()
 	_test_net_link_compiles_and_starts_offline()
 	_test_a_finished_snapshot_ends_the_match_on_the_client()
+	_test_a_guest_cannot_choose_a_name_the_panel_will_obey()
+	_test_the_host_turns_away_a_different_build()
+	_test_a_flooding_peer_runs_out_of_input_budget()
 	_test_net_link_offers_a_rematch_handshake()
 	_test_throw_key_is_bound()
+	await _test_the_lobby_stacks_without_overlapping()
+	await _test_the_brewing_mug_reads_as_unfinished()
+	await _test_the_side_panel_text_never_leaves_its_column()
+	await _test_the_roster_panel_holds_four_full_names()
 	_test_touch_pad_presses_the_same_actions_as_the_keyboard()
 	await _test_every_touch_button_is_wired()
 	await _test_tapping_play_starts_a_run()
@@ -1369,6 +1376,54 @@ func _test_net_link_offers_a_rematch_handshake() -> void:
 	link.free()
 
 
+# The roster panel draws these names as bbcode, and a guest's name is the one
+# string in it another machine chooses. Cleaning it locally was never enough:
+# the host stores whatever arrives on the wire.
+func _test_a_guest_cannot_choose_a_name_the_panel_will_obey() -> void:
+	var link := NetLinkClass.new()
+	link.roster = [{"peer_id": 1, "index": 0, "name": "HOST"}]
+	link._claim_slot(77, "[img]res://icon.svg[/img]")
+	var stored := link.name_of(1)
+	_expect(not stored.contains("["), "a name a guest sends loses its bbcode brackets")
+	_expect(stored.length() <= SaveDataClass.NAME_LENGTH, "and is clipped like a local one")
+	link._claim_slot(78, "  quiet  ")
+	_expect(link.name_of(2) == "QUIET", "an ordinary name still arrives intact")
+	link.free()
+
+
+# Two builds that disagree about a snapshot's shape used to connect happily and
+# then draw two different boards. announce_ready reaches this through a live
+# peer, so the guard itself is what the suite can hold onto.
+func _test_the_host_turns_away_a_different_build() -> void:
+	var link := NetLinkClass.new()
+	_expect(NetLinkClass.PROTOCOL_VERSION > 0, "the link carries a protocol version")
+	_expect(link.accepts_protocol(NetLinkClass.PROTOCOL_VERSION), "its own build is let in")
+	_expect(not link.accepts_protocol(NetLinkClass.PROTOCOL_VERSION + 1), "a newer one is turned away")
+	_expect(not link.accepts_protocol(0), "and so is a build too old to send a version at all")
+	link.free()
+
+
+# A guest posts one input per physics tick. A peer that ignores that and floods
+# must not get to spend the host's frame on it.
+func _test_a_flooding_peer_runs_out_of_input_budget() -> void:
+	var link := NetLinkClass.new()
+	link.role = NetLinkClass.Role.HOST
+	link._input_budget[77] = 3.0
+	var heard := 0
+	for attempt in range(20):
+		if link._spend_input_budget(77):
+			heard += 1
+	_expect(heard == 3, "a peer is heard only as often as its budget allows")
+	# _process refills the buckets, and would put a discovery beacon on a socket
+	# this link never opened; the countdown holds it off for the one tick.
+	link._beacon_countdown = 999.0
+	link._process(1.0)
+	_expect(link._spend_input_budget(77), "and is heard again once the bucket refills")
+	_expect(link._input_budget[77] <= NetLinkClass.INPUT_BUDGET,
+		"which never fills past the cap, however long the peer stays quiet")
+	link.free()
+
+
 func _test_net_link_compiles_and_starts_offline() -> void:
 	var link := NetLinkClass.new()
 	_expect(link != null, "net_link.gd compiles")
@@ -1385,6 +1440,177 @@ func _test_throw_key_is_bound() -> void:
 	for event in InputMap.action_get_events("throw"):
 		bound = bound or event is InputEventKey
 	_expect(bound, "the coffee throw is reachable from the keyboard")
+
+
+# How tall the status Label actually draws: it wraps on the column width, and a
+# Label draws its whole text whether or not the box it was given has room.
+func _text_height(text: String, font_size: int, width: float) -> float:
+	var font := ThemeDB.fallback_font
+	var total := 0.0
+	for line in text.split("\n"):
+		var wrapped := font.get_multiline_string_size(
+			line, HORIZONTAL_ALIGNMENT_LEFT, width, font_size, 100,
+			TextServer.BREAK_WORD_BOUND | TextServer.BREAK_MANDATORY)
+		total += maxf(wrapped.y, font.get_height(font_size))
+	return total
+
+
+# The lobby's body text carries the control hints, and the touch hints run a line
+# longer than the keyboard ones - 120px against 96px. The list below it sat at a
+# fixed y=330, so on a phone, and only on a phone, it was drawn over the body's
+# last line. A busy network was the other way in: nine games ran 253px, straight
+# through the address field and off the bottom of the screen.
+func _test_the_lobby_stacks_without_overlapping() -> void:
+	var main: Variant = load("res://scenes/main.tscn").instantiate()
+	root.add_child(main)
+	await process_frame
+	for on_pad in [false, true]:
+		for found in [0, 1, 9]:
+			main.touch.visible = on_pad
+			main._show_lobby()
+			main.net.stop_browsing()
+			main.net.found_games.clear()
+			for index in range(found):
+				main.net.found_games.append({
+					"address": "192.168.178.%d" % (100 + index), "name": "Plantation %d" % index,
+					"players": 2, "last_seen": 0.0,
+				})
+			main._refresh_lobby_list()
+			var where := "pad=%s games=%d" % [on_pad, found]
+			var body_bottom: float = (main.LOBBY_BODY_TOP
+				+ float(main.overlay_body.get_line_count()) * main.overlay_body.get_line_height())
+			_expect(body_bottom <= main.lobby_list.position.y,
+				"the list starts below the body text (%s: body ends %.0f, list at %.0f)"
+					% [where, body_bottom, main.lobby_list.position.y])
+			var list_bottom: float = (main.lobby_list.position.y
+				+ float(main.lobby_list.get_line_count()) * main.lobby_list.get_line_height())
+			_expect(list_bottom <= main.LOBBY_ADDRESS_TOP,
+				"and ends above the address field (%s: ends %.0f)" % [where, list_bottom])
+			_expect(list_bottom <= 540.0, "and on the screen (%s: ends %.0f)" % [where, list_bottom])
+	_expect(main.lobby_list.clip_text, "the list clips, so an unmeasured row can never bleed")
+	main._hide_lobby_widgets()
+	await create_timer(0.8).timeout
+	main.queue_free()
+	await process_frame
+
+
+# The mug's fade was written but left commented out, so a half-brewed cup was
+# drawn at full opacity and only slightly smaller than a ready one - the two
+# states looked almost alike. Both cues are checked here because the code says in
+# a comment that it uses them.
+func _test_the_brewing_mug_reads_as_unfinished() -> void:
+	var main: Variant = load("res://scenes/main.tscn").instantiate()
+	root.add_child(main)
+	await process_frame
+	main.state.start_game()
+	var slot: PlayerSlot = main.state.players[0]
+	var readings := {}
+	for ratio in [0.5, 0.9, 1.0]:
+		slot.coffee_charge = GameStateClass.COFFEE_CHARGE_TIME * ratio
+		main._update_coffee_cup()
+		_expect(main.coffee_cup.visible, "the mug is on screen at %d%% brewed" % int(ratio * 100.0))
+		readings[ratio] = {"scale": main.coffee_cup.scale.x, "alpha": main.coffee_cup.modulate.a}
+	var armed: Dictionary = readings[1.0]
+	_expect(is_equal_approx(armed["alpha"], 1.0), "a ready mug is fully opaque")
+	# A ready mug breathes by 8% either way, so it is checked against its band
+	# rather than used as the yardstick the brewing sizes are measured off.
+	_expect(absf(armed["scale"] - 1.0) <= 0.09, "and drawn at full size (%.2f)" % armed["scale"])
+	for ratio in [0.5, 0.9]:
+		var brewing: Dictionary = readings[ratio]
+		_expect(brewing["alpha"] < 0.8,
+			"a mug at %d%% is clearly see-through (alpha %.2f)" % [int(ratio * 100.0), brewing["alpha"]])
+		_expect(brewing["scale"] < 0.75,
+			"and clearly smaller than a ready one (%.2f)" % brewing["scale"])
+	_expect(readings[0.9]["alpha"] > readings[0.5]["alpha"], "the mug darkens as it fills")
+	_expect(readings[0.9]["scale"] > readings[0.5]["scale"], "and grows as it fills")
+	await create_timer(0.8).timeout
+	main.queue_free()
+	await process_frame
+
+
+# The status text used to be positioned by two hardcoded numbers and given a box
+# it freely overflowed - solo play drew 230px of text into a 130px box, straight
+# through the THROW ring at y=410, and a knocked-out player's text ran 36px off
+# the bottom of a 540px screen. Nothing caught it because a Label neither clips
+# nor complains. Every combination is measured here instead.
+func _test_the_side_panel_text_never_leaves_its_column() -> void:
+	var main: Variant = load("res://scenes/main.tscn").instantiate()
+	root.add_child(main)
+	await process_frame
+	# The panel is only ever on screen during a run; every other mode has the menu
+	# overlay over it, which is why `secondary` is allowed to sit in the column.
+	main.ui_mode = main.UiMode.PLAYING
+	for on_pad in [false, true]:
+		main.touch.visible = on_pad
+		for in_match in [false, true]:
+			main.match_state = MatchStateClass.new(11, 4) if in_match else null
+			main.local_player = 0
+			for phase in [
+				GameStateClass.Phase.READY, GameStateClass.Phase.PLAYING,
+				GameStateClass.Phase.WON, GameStateClass.Phase.GAME_OVER,
+			]:
+				main.state.phase = phase
+				for knocked_out in [false, true]:
+					if in_match:
+						main.match_state.players[0].is_out = knocked_out
+					elif knocked_out:
+						continue
+					main._refresh()
+					var where := "pad=%s match=%s phase=%d out=%s" % [on_pad, in_match, phase, knocked_out]
+					var box: float = main.status_label.size.y
+					var drawn := _text_height(main.status_label.text, 16, main.PANEL_WIDTH)
+					var bottom: float = main.status_label.position.y + drawn
+					_expect(drawn <= box, "the status text fits its box (%s: %.0f in %.0f)" % [where, drawn, box])
+					_expect(bottom <= 540.0, "and stays on the screen (%s: ends at %.0f)" % [where, bottom])
+					if on_pad:
+						var column := Rect2(
+							main.status_label.position.x, main.status_label.position.y,
+							main.PANEL_WIDTH, drawn)
+						for spec: Dictionary in main._touch_button_specs():
+							var place: Dictionary = TouchControlsClass.PLACES[spec["place"]]
+							var radius: float = place["radius"]
+							var disc := Rect2(place["center"] - Vector2(radius, radius), Vector2(radius, radius) * 2.0)
+							_expect(not column.intersects(disc),
+								"the %s button clears the text column (%s)" % [spec["id"], where])
+					if in_match:
+						var roster_bottom: float = main.roster_label.position.y + main.roster_label.size.y
+						_expect(roster_bottom <= main.status_label.position.y,
+							"the roster ends before the status text starts (%s)" % where)
+	_expect(main.status_label.clip_text, "the status box clips, so an unmeasured string can never bleed again")
+	var primary: Dictionary = TouchControlsClass.PLACES[&"primary"]
+	_expect(primary["center"].x + float(primary["radius"]) <= TouchControlsClass.PANEL_EDGE,
+		"the button a run puts on screen stays out of the panel column entirely")
+	_expect(main.PANEL_X >= TouchControlsClass.PANEL_EDGE, "and the column starts where the pad says it does")
+	main.match_state = null
+	await create_timer(0.8).timeout
+	main.queue_free()
+	await process_frame
+
+
+# Four players with names of the full allowed length stood 234px tall in a 150px
+# box, so the last two were simply not drawn. The standings line is set smaller
+# than the name for exactly this reason.
+func _test_the_roster_panel_holds_four_full_names() -> void:
+	var main: Variant = load("res://scenes/main.tscn").instantiate()
+	root.add_child(main)
+	await process_frame
+	main.match_state = MatchStateClass.new(7, 4)
+	main.local_player = 0
+	var long_name := "W".repeat(SaveDataClass.NAME_LENGTH)
+	for player_index in range(4):
+		main.match_state.players[player_index].score = 999999
+		main.match_state.players[player_index].lives = 9
+	main._refresh()
+	var drawn := 0.0
+	for player_index in range(4):
+		drawn += _text_height(long_name, main.ROSTER_NAME_SIZE, main.PANEL_WIDTH)
+		drawn += _text_height(" 999999 L9 HERE!", main.ROSTER_STAT_SIZE, main.PANEL_WIDTH)
+	_expect(drawn <= main.roster_label.size.y,
+		"four full-length names fit the roster box (%.0f in %.0f)" % [drawn, main.roster_label.size.y])
+	main.match_state = null
+	await create_timer(0.8).timeout
+	main.queue_free()
+	await process_frame
 
 
 func _test_touch_pad_presses_the_same_actions_as_the_keyboard() -> void:

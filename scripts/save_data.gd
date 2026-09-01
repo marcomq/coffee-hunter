@@ -31,13 +31,16 @@ static func player_name() -> String:
 
 static func set_player_name(value: String) -> void:
 	var config := _config()
-	config.set_value(SECTION, "player_name", _clean_name(value))
+	config.set_value(SECTION, "player_name", clean_name(value))
 	config.save(path)
 
 
 # Upper case and clipped, so a long name cannot push the score out of the panel.
-static func _clean_name(value: String) -> String:
-	var cleaned := value.strip_edges().to_upper()
+# Square brackets go too: the roster panel draws these names as bbcode, and a
+# name is the one string in it that someone else's machine gets to choose.
+# Public because the host has to run every name a guest announces through it.
+static func clean_name(value: String) -> String:
+	var cleaned := value.strip_edges().to_upper().replace("[", "").replace("]", "")
 	if cleaned == "":
 		return DEFAULT_NAME
 	return cleaned.substr(0, NAME_LENGTH)
@@ -88,7 +91,7 @@ static func record_run(score: int, level_index: int, name := "") -> bool:
 		var config := _config()
 		var entries := scores()
 		entries.append({
-			"name": _clean_name(name if name != "" else player_name()),
+			"name": clean_name(name if name != "" else player_name()),
 			"score": score,
 			"level": level_index,
 		})

@@ -9,6 +9,8 @@ extends Node
 # why joining by typed address is a first-class path rather than a debug hatch:
 # it already carries Tailscale/ZeroTier addresses and 127.0.0.1 today.
 
+const SaveDataClass = preload("res://scripts/save_data.gd")
+
 signal lobby_changed
 signal roster_changed
 signal link_ready(player_index: int)
@@ -33,6 +35,13 @@ const BIND_RETRY_INTERVAL := 1.0
 # A host that has gone quiet for this long drops off the browser.
 const BEACON_TIMEOUT := 4.0
 const BEACON_TAG := "coffee-hunter-v1"
+# Bumped whenever a snapshot or an RPC changes shape. The beacon tag only gates
+# what the browser lists; a join by typed address skips discovery entirely, so
+# the handshake below is the only place a mismatched build is actually caught.
+const PROTOCOL_VERSION := 1
+# A guest posts one input per physics tick. Twice that leaves plenty of room for
+# a jittery sender while still cutting off a peer that floods the host.
+const INPUT_BUDGET := 140.0
 
 var role := Role.OFFLINE
 var found_games: Array[Dictionary] = []
@@ -55,6 +64,8 @@ var _local_name := "PAOLO"
 # The slot this peer last knew as its own; a rematch can renumber it.
 var _seated_index := -1
 var _closing := false
+# peer_id -> inputs still allowed this second, refilled in _process.
+var _input_budget: Dictionary[int, float] = {}
 
 
 func _ready() -> void:
@@ -80,7 +91,7 @@ func host(player_name := "PAOLO") -> bool:
 	_seated_index = 0
 	_local_name = player_name
 	_host_name = player_name
-	roster = [{"peer_id": 1, "index": 0, "name": player_name}]
+	roster = [{"peer_id": 1, "index": 0, "name": SaveDataClass.clean_name(player_name)}]
 	accepting = true
 	_beacon.set_broadcast_enabled(true)
 	_beacon.set_dest_address("255.255.255.255", DISCOVERY_PORT)
@@ -190,6 +201,9 @@ func _process(delta: float) -> void:
 				"port": GAME_PORT,
 				"players": roster.size(),
 			}))
+	if role == Role.HOST:
+		for peer_id in _input_budget:
+			_input_budget[peer_id] = minf(_input_budget[peer_id] + INPUT_BUDGET * delta, INPUT_BUDGET)
 	if _browse_wanted and not _browsing:
 		_bind_retry -= delta
 		if _bind_retry <= 0.0 and _bind_browser():
@@ -288,7 +302,7 @@ func _claim_slot(peer_id: int, player_name: String) -> int:
 		taken.append(int(entry["index"]))
 	for candidate in range(MAX_PLAYERS):
 		if not taken.has(candidate):
-			roster.append({"peer_id": peer_id, "index": candidate, "name": player_name})
+			roster.append({"peer_id": peer_id, "index": candidate, "name": SaveDataClass.clean_name(player_name)})
 			roster.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return int(a["index"]) < int(b["index"]))
 			return candidate
 	return -1
@@ -331,6 +345,7 @@ func _on_peer_disconnected(peer_id: int) -> void:
 	var index := index_of_peer(peer_id)
 	if index < 0:
 		return
+	_input_budget.erase(peer_id)
 	for entry_index in range(roster.size()):
 		if int(roster[entry_index]["peer_id"]) == peer_id:
 			roster.remove_at(entry_index)
@@ -343,7 +358,7 @@ func _on_peer_disconnected(peer_id: int) -> void:
 
 func _on_connected_to_server() -> void:
 	status_text = "Connected - waiting for a slot"
-	announce_ready.rpc_id(1, _local_name)
+	announce_ready.rpc_id(1, _local_name, PROTOCOL_VERSION)
 
 
 func _on_connection_failed() -> void:
@@ -352,6 +367,22 @@ func _on_connection_failed() -> void:
 
 func _on_server_disconnected() -> void:
 	disconnect_link("The host closed the game")
+
+
+# A build that disagrees about a snapshot's shape draws a different board from
+# the same bytes, so it is turned away at the handshake rather than let in.
+func accepts_protocol(protocol: int) -> bool:
+	return protocol == PROTOCOL_VERSION
+
+
+# One input per physics tick is the honest rate; a peer that exceeds its bucket
+# is simply not heard until the bucket refills.
+func _spend_input_budget(peer_id: int) -> bool:
+	var budget: float = _input_budget.get(peer_id, INPUT_BUDGET)
+	if budget < 1.0:
+		return false
+	_input_budget[peer_id] = budget - 1.0
+	return true
 
 
 func send_input(direction: Vector2i, throw_pressed: bool) -> void:
@@ -407,10 +438,15 @@ func push_rematch(flags: PackedByteArray) -> void:
 
 
 @rpc("any_peer", "call_remote", "reliable")
-func announce_ready(player_name: String) -> void:
+func announce_ready(player_name: String, protocol := 0) -> void:
 	if role != Role.HOST:
 		return
 	var peer_id := multiplayer.get_remote_sender_id()
+	# Two builds that disagree on a snapshot's shape connect perfectly happily and
+	# then draw two different boards. Better to say so than to desync.
+	if not accepts_protocol(protocol):
+		push_rejected.rpc_id(peer_id, "That build is a different version of the game")
+		return
 	if not accepting:
 		push_rejected.rpc_id(peer_id, "The race is already running - try again shortly")
 		return
@@ -451,13 +487,14 @@ func push_roster(entries: Array) -> void:
 func submit_input(direction: Vector2i, throw_pressed: bool) -> void:
 	if role != Role.HOST:
 		return
-	var index := index_of_peer(multiplayer.get_remote_sender_id())
-	if index < 0:
+	var peer_id := multiplayer.get_remote_sender_id()
+	var index := index_of_peer(peer_id)
+	if index < 0 or not _spend_input_budget(peer_id):
 		return
 	input_received.emit(index, direction, throw_pressed)
 
 
-@rpc("authority", "call_remote", "unreliable")
+@rpc("authority", "call_remote", "unreliable_ordered")
 func push_snapshot(payload: PackedByteArray) -> void:
 	snapshot_received.emit(payload)
 
